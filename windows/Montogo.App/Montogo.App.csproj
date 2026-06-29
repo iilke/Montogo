@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Montogo.Driver\Montogo.Driver.csproj" />
+    <ProjectReference Include="..\Montogo.Capture\Montogo.Capture.csproj" />
+    <ProjectReference Include="..\Montogo.Encoding\Montogo.Encoding.csproj" />
+    <ProjectReference Include="..\Montogo.Transport\Montogo.Transport.csproj" />
+    <ProjectReference Include="..\Montogo.Protocol\Montogo.Protocol.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

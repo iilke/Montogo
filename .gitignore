@@ -1,0 +1,24 @@
+# .NET build output
+bin/
+obj/
+*.user
+
+# NuGet
+*.nupkg
+.nuget/
+packages/
+
+# IDE
+.vs/
+.idea/
+*.suo
+*.sln.docstates
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Mac app (future)
+mac/.build/
+mac/*.xcodeproj/xcuserdata/
+mac/*.xcworkspace/xcuserdata/

@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path . -Recurse)",
+      "Bash(Select-Object -Property FullName)",
+      "PowerShell(head -150)",
+      "Bash(git config *)",
+      "PowerShell(New-Item -ItemType Directory -Force -Path \"windows\")",
+      "PowerShell(dotnet new sln -n Montogo -o \"windows\")",
+      "PowerShell(dotnet new winforms -n Montogo.App -o \"windows\\\\Montogo.App\" -f net8.0-windows)",
+      "PowerShell(dotnet new winforms -n Montogo.App -o \"windows\\\\Montogo.App\" -f net8.0)",
+      "PowerShell(dotnet new classlib -n Montogo.Driver -o \"windows\\\\Montogo.Driver\" -f net8.0-windows)",
+      "PowerShell(dotnet new classlib -n Montogo.Capture -o \"windows\\\\Montogo.Capture\" -f net8.0-windows)",
+      "PowerShell(dotnet new classlib -n Montogo.Encoding -o \"windows\\\\Montogo.Encoding\" -f net8.0-windows)",
+      "PowerShell(dotnet new classlib -n Montogo.Input -o \"windows\\\\Montogo.Input\" -f net8.0-windows)",
+      "PowerShell(dotnet new classlib -n Montogo.Driver -o \"windows\\\\Montogo.Driver\")",
+      "PowerShell(dotnet new classlib -n Montogo.Capture -o \"windows\\\\Montogo.Capture\")",
+      "PowerShell(dotnet new classlib -n Montogo.Encoding -o \"windows\\\\Montogo.Encoding\")",
+      "PowerShell(dotnet new classlib -n Montogo.Input -o \"windows\\\\Montogo.Input\")",
+      "PowerShell(dotnet new classlib -n Montogo.Transport -o \"windows\\\\Montogo.Transport\")",
+      "PowerShell(dotnet new classlib -n Montogo.Protocol -o \"windows\\\\Montogo.Protocol\")",
+      "PowerShell(dotnet sln \"windows\\\\Montogo.sln\" add \"windows\\\\Montogo.App\\\\Montogo.App.csproj\" \"windows\\\\Montogo.Driver\\\\Montogo.Driver.csproj\" \"windows\\\\Montogo.Capture\\\\Montogo.Capture.csproj\" \"windows\\\\Montogo.Encoding\\\\Montogo.Encoding.csproj\" \"windows\\\\Montogo.Transport\\\\Montogo.Transport.csproj\" \"windows\\\\Montogo.Input\\\\Montogo.Input.csproj\" \"windows\\\\Montogo.Protocol\\\\Montogo.Protocol.csproj\")",
+      "PowerShell(dotnet sln \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.sln\" add \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.App\\\\Montogo.App.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Driver\\\\Montogo.Driver.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Capture\\\\Montogo.Capture.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Encoding\\\\Montogo.Encoding.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Transport\\\\Montogo.Transport.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Input\\\\Montogo.Input.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Protocol\\\\Montogo.Protocol.csproj\")",
+      "PowerShell(dotnet sln \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.slnx\" add \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.App\\\\Montogo.App.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Driver\\\\Montogo.Driver.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Capture\\\\Montogo.Capture.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Encoding\\\\Montogo.Encoding.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Transport\\\\Montogo.Transport.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Input\\\\Montogo.Input.csproj\" \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Protocol\\\\Montogo.Protocol.csproj\")",
+      "PowerShell(dotnet build \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.slnx\" 2>&1)",
+      "Bash(git add *)",
+      "Bash(git reset *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(gh pr *)",
+      "PowerShell(gh pr list --repo iilke/Montogo --state all)",
+      "PowerShell(dotnet new xunit -n Montogo.Tests -o \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Tests\" 2>&1)",
+      "PowerShell(dotnet test \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Tests\\\\Montogo.Tests.csproj\" --logger \"console;verbosity=normal\" 2>&1)"
+    ]
+  }
+}
