@@ -16,4 +16,12 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
+  <!-- Copy the virtual-display-rs CLI into driver\ next to the built exe for every
+       build config, so CliPathResolver finds it in Debug and Release alike.
+       The binary is provided per-machine (see driver\ in the source tree) and is
+       git-ignored, matching the "user installs the driver separately" design. -->
+  <ItemGroup>
+    <None Include="driver\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

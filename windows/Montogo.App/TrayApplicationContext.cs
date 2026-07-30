@@ -35,6 +35,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private VirtualDisplayManager? _driver;
 
     // Pipeline components — null until the Mac connects
+    private UdpClient?   _listener;    // bound to LAN:47921; kept alive for the pipeline so video shares the same source port
     private DxgiCapture? _capture;
     private H264Encoder? _encoder;
     private UdpSender?   _sender;
@@ -130,31 +131,59 @@ internal sealed class TrayApplicationContext : ApplicationContext
             ? $"Waiting for Mac… (LAN: {lanIp})"
             : $"Waiting for Mac… (warning: {warning})");
 
-        using var listener = new UdpClient(new IPEndPoint(lanIp, ProtocolConstants.VideoPort));
+        // Do not use 'using' here — listener is kept alive as a field so UdpSender can
+        // send video from the same port (47921).  Disposed in ExitApplication / Dispose.
+        _listener = new UdpClient(new IPEndPoint(lanIp, ProtocolConstants.VideoPort));
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                UdpReceiveResult result = await listener.ReceiveAsync(ct);
+                UdpReceiveResult result = await _listener.ReceiveAsync(ct);
                 if (!IsHandshakeRequest(result.Buffer)) continue;
-
-                // Once the pipeline is running, drop all further handshake packets
-                // silently — this prevents the DoS amplification described in the
-                // security review (repeated handshakes forcing new pipeline starts).
-                if (_capture is not null) continue;
 
                 var req = MemoryMarshal.Read<HandshakeRequestPacket>(result.Buffer);
 
                 // Reject requests whose token does not match: unknown device.
-                if (!_security.ValidateToken(req.ClientId, req.Token)) continue;
+                // Validating before the pipeline-running check keeps the DoS
+                // protection (unauthenticated floods never touch the pipeline)
+                // while allowing a relaunched Mac to reconnect below.
+                if (!_security.ValidateToken(req.ClientId, req.Token))
+                {
+                    // Surface the rejection locally (not to the network) so a wrong
+                    // connection code is visible instead of a silent "stuck connecting".
+                    // Only while not yet streaming, so it can't disturb a live session.
+                    if (_capture is null)
+                        UpdateStatus($"Wrong code from {result.RemoteEndPoint.Address} — Mac must enter {_security.ConnectionCode}");
+                    continue;
+                }
+
+                if (_capture is not null)
+                {
+                    // Authenticated re-handshake: the Mac app was relaunched (new
+                    // ClientId) or lost the connection. Re-target the running
+                    // pipeline and resend the response with the existing nonce
+                    // prefix — no pipeline restart. Force a keyframe so the new
+                    // session can start decoding immediately (the GOP is long).
+                    _encoder!.RequestKeyFrame();
+                    _sender!.SetTarget(new IPEndPoint(result.RemoteEndPoint.Address, ProtocolConstants.VideoPort));
+                    await SendHandshakeResponseAsync(
+                        _listener, result.RemoteEndPoint, display, req.ClientId,
+                        targetFps, _sender.NoncePrefix, ct);
+                    UpdateStatus($"Connected – {result.RemoteEndPoint.Address} " +
+                        $"({(_encoder!.IsHardwareAccelerated ? "HW" : "SW")} {targetFps} fps, re-handshake)");
+                    continue;
+                }
 
                 // Create sender now so its nonce prefix is known before the response goes out.
                 // The Mac must receive the prefix before any encrypted chunks arrive.
-                _sender = new UdpSender(_security.Cipher);
+                // Pass the listener so video is sent from the same source port (47921).
+                // This lets the Mac's stateful firewall treat video as a reply to the
+                // outbound handshake rather than unsolicited inbound traffic.
+                _sender = new UdpSender(_security.Cipher, sendSocket: _listener);
                 _sender.SetTarget(new IPEndPoint(result.RemoteEndPoint.Address, ProtocolConstants.VideoPort));
 
                 await SendHandshakeResponseAsync(
-                    listener, result.RemoteEndPoint, display, req.ClientId,
+                    _listener, result.RemoteEndPoint, display, req.ClientId,
                     targetFps, _sender.NoncePrefix, ct);
 
                 StartPipeline(display, targetFps, targetBitrate);
@@ -231,6 +260,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         // Wire capture output → channel.
         _capture = new DxgiCapture(
             new CaptureOptions { OutputIndex = display.Index, TargetFps = targetFps });
+        _capture.CaptureFailed += ex => UpdateStatus($"Capture error: {ex.Message}");
         _capture.FrameCaptured += frame =>
         {
             long ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L; // ms → µs
@@ -267,7 +297,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _channel?.Writer.TryComplete();               // signals pipeline task to finish
         _pipelineTask?.Wait(TimeSpan.FromSeconds(2)); // wait for encode+send to drain
         _encoder?.Dispose();                          // sends NOTIFY_END_STREAMING + MFShutdown
-        _sender?.Dispose();
+        _sender?.Dispose();                            // does NOT close _listener (not owned)
+        _listener?.Dispose();                          // close after sender is done
         try { _driver?.RemoveAllAsync().GetAwaiter().GetResult(); } catch { }
         Application.Exit();
     }
@@ -292,6 +323,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _cts.Dispose();
             _security.Dispose();
             _driver?.Dispose();
+            _listener?.Dispose();
             _trayIcon.Dispose();
         }
         base.Dispose(disposing);

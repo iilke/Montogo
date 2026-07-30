@@ -30,7 +30,9 @@
       "Bash(gh pr *)",
       "PowerShell(gh pr list --repo iilke/Montogo --state all)",
       "PowerShell(dotnet new xunit -n Montogo.Tests -o \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Tests\" 2>&1)",
-      "PowerShell(dotnet test \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Tests\\\\Montogo.Tests.csproj\" --logger \"console;verbosity=normal\" 2>&1)"
+      "PowerShell(dotnet test \"C:\\\\Users\\\\ilke\\\\Documents\\\\GitHub\\\\Montogo\\\\windows\\\\Montogo.Tests\\\\Montogo.Tests.csproj\" --logger \"console;verbosity=normal\" 2>&1)",
+      "Bash(gh auth *)",
+      "Bash(which swiftc *)"
     ]
   }
 }

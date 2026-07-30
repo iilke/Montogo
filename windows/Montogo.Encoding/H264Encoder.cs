@@ -10,14 +10,12 @@ namespace Montogo.Encoding;
 public sealed class H264Encoder : IDisposable
 {
     private static readonly int MF_E_TRANSFORM_NEED_MORE_INPUT = unchecked((int)0xC00D6D72);
+    private static readonly int MF_E_NO_EVENTS_AVAILABLE       = unchecked((int)0xC00D3E80);
 
-    // Hardware encoder CLSIDs tried in priority order
-    private static readonly (Guid Clsid, string Name)[] HardwareCandidates =
-    [
-        (new Guid("8FD38F55-B9B6-4B14-AE64-7C4B8C4D6C7F"), "NVENC"),
-        (new Guid("4BE8D3C0-0515-4A37-AD55-E4BAE19AF471"), "Intel Quick Sync"),
-        (new Guid("ADC9BC80-0F41-46C6-AB75-D693D793597D"), "AMD AMF"),
-    ];
+    // MediaEventType values for async MFTs (mfobjects.h)
+    private const uint METransformNeedInput  = 601;
+    private const uint METransformHaveOutput = 602;
+    private const uint MF_EVENT_FLAG_NO_WAIT = 1;
 
     // Microsoft H.264 Video Encoder MFT (software, always available on Win 7+)
     private static readonly Guid SoftwareClsid = new("6CA50344-051A-4DED-9779-A43305165E35");
@@ -27,6 +25,21 @@ public sealed class H264Encoder : IDisposable
     private byte[]? _nv12;
     private long _frameDurationHns;
     private bool _started;
+
+    // Software MFTs require caller-allocated output samples; the sample and its
+    // buffer are created once in Initialize and reused for every ProcessOutput.
+    private IMFSample? _reusableOutputSample;
+
+    // Non-null when the active encoder is an async MFT (all hardware encoders are).
+    // Async MFTs must be driven by their event queue: ProcessInput is only legal
+    // after a METransformNeedInput event, ProcessOutput after METransformHaveOutput.
+    private IMFMediaEventGenerator? _eventGen;
+    private int _pendingNeedInput;
+
+    // Retained ICodecAPI + a cross-thread flag so RequestKeyFrame can force an IDR
+    // on the next frame (set from the handshake thread, applied on the pipeline thread).
+    private ICodecAPI? _codecApi;
+    private int _forceKeyframe;
 
     /// <summary>True if the active encoder is a hardware GPU encoder (NVENC / Quick Sync / AMF).</summary>
     public bool IsHardwareAccelerated { get; private set; }
@@ -38,7 +51,7 @@ public sealed class H264Encoder : IDisposable
     // ── Encoder probe ────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Probes for a hardware H.264 MFT via cheap COM instantiation.
+    /// Probes for a hardware H.264 MFT via MFTEnumEx.
     /// Call this before creating EncoderOptions so you can pick the right fps.
     /// Does its own MFStartup/MFShutdown pair — safe to call before Initialize().
     /// </summary>
@@ -48,23 +61,49 @@ public sealed class H264Encoder : IDisposable
             return false;
         try
         {
-            foreach (var (clsid, _) in HardwareCandidates)
-            {
-                try
-                {
-                    var t = Type.GetTypeFromCLSID(clsid);
-                    if (t is null) continue;
-                    if (Activator.CreateInstance(t) is { } mft)
-                    {
-                        Marshal.ReleaseComObject(mft);
-                        return true;
-                    }
-                }
-                catch { }
-            }
-            return false;
+            EnumHardwareEncoders(activateFirst: false, out uint count);
+            return count > 0;
         }
         finally { PInvoke.MFShutdown(); }
+    }
+
+    /// <summary>
+    /// Enumerates hardware H.264 encoder MFTs.  With activateFirst the first one
+    /// (MFT_ENUM_FLAG_SORTANDFILTER orders by merit) is activated and returned.
+    /// </summary>
+    private static unsafe IMFTransform? EnumHardwareEncoders(bool activateFirst, out uint count)
+    {
+        var outType = new MFT_REGISTER_TYPE_INFO
+        {
+            guidMajorType = PInvoke.MFMediaType_Video,
+            guidSubtype   = PInvoke.MFVideoFormat_H264,
+        };
+
+        PInvoke.MFTEnumEx(
+            PInvoke.MFT_CATEGORY_VIDEO_ENCODER,
+            MFT_ENUM_FLAG.MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG.MFT_ENUM_FLAG_SORTANDFILTER,
+            null, outType,
+            out IMFActivate_unmanaged** activates, out count).ThrowOnFailure();
+
+        if (count == 0) return null;
+
+        try
+        {
+            if (!activateFirst) return null;
+
+            var activate = (IMFActivate)Marshal.GetObjectForIUnknown((IntPtr)activates[0]);
+            try
+            {
+                Guid iid = typeof(IMFTransform).GUID;
+                return (IMFTransform)activate.ActivateObject(&iid);
+            }
+            finally { Marshal.ReleaseComObject(activate); }
+        }
+        finally
+        {
+            for (uint i = 0; i < count; i++) Marshal.Release((IntPtr)activates[i]);
+            Marshal.FreeCoTaskMem((IntPtr)activates);
+        }
     }
 
     // ── Initialization ───────────────────────────────────────────────────────
@@ -77,6 +116,22 @@ public sealed class H264Encoder : IDisposable
 
         (_encoder, IsHardwareAccelerated) = CreateEncoder();
 
+        // Hardware MFTs advertise MFT_OUTPUT_STREAM_PROVIDES_SAMPLES and allocate
+        // their own output samples (pSample = null).  The Microsoft software H.264
+        // MFT does not — it returns E_INVALIDARG unless the caller supplies one.
+        _encoder.GetOutputStreamInfo(0, out MFT_OUTPUT_STREAM_INFO streamInfo);
+        const uint MFT_OUTPUT_STREAM_PROVIDES_SAMPLES = 0x100;
+        if ((streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0)
+        {
+            uint size = streamInfo.cbSize > 0
+                ? streamInfo.cbSize
+                : (uint)(_options.Width * _options.Height * 2);
+            PInvoke.MFCreateMemoryBuffer(size, out IMFMediaBuffer outBuf).ThrowOnFailure();
+            PInvoke.MFCreateSample(out IMFSample outSample).ThrowOnFailure();
+            outSample.AddBuffer(outBuf);
+            _reusableOutputSample = outSample;
+        }
+
         _encoder.ProcessMessage(MFT_MESSAGE_TYPE.MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         _encoder.ProcessMessage(MFT_MESSAGE_TYPE.MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
@@ -87,29 +142,97 @@ public sealed class H264Encoder : IDisposable
 
     private (IMFTransform Mft, bool IsHardware) CreateEncoder()
     {
-        // Try each hardware encoder. SetupTypesOn throws if the MFT rejects our config
-        // (absent hardware, wrong driver, unsupported resolution, etc.).
-        foreach (var (clsid, name) in HardwareCandidates)
+        // Hardware first: MFTEnumEx finds whatever the GPU driver registered
+        // (NVENC / Quick Sync / AMF) without hard-coded vendor CLSIDs.
+        try
         {
-            try
+            if (EnumHardwareEncoders(activateFirst: true, out _) is { } hwMft)
             {
-                var t = Type.GetTypeFromCLSID(clsid);
-                if (t is null) continue;
-                var mft = (IMFTransform)Activator.CreateInstance(t)!;
-                SetupTypesOn(mft);
-                Trace.WriteLine($"[Montogo.Encoding] Using hardware H.264 encoder: {name}");
-                return (mft, IsHardware: true);
+                try
+                {
+                    PrepareMft(hwMft);
+                    Trace.WriteLine("[Montogo.Encoding] Using hardware H.264 encoder MFT");
+                    return (hwMft, IsHardware: true);
+                }
+                catch
+                {
+                    // Config rejected (unsupported resolution, driver quirk…) — release
+                    // and fall through to software.
+                    _eventGen = null;
+                    _pendingNeedInput = 0;
+                    Marshal.ReleaseComObject(hwMft);
+                }
             }
-            catch { }
         }
+        catch { }
 
         // Software fallback — guaranteed to exist on all supported Windows versions
         Trace.WriteLine("[Montogo.Encoding] No hardware H.264 encoder found; falling back to Microsoft software MFT");
         var softType = Type.GetTypeFromCLSID(SoftwareClsid, throwOnError: true)!;
         var softMft  = (IMFTransform)Activator.CreateInstance(softType)!;
-        SetupTypesOn(softMft);
+        PrepareMft(softMft);
         return (softMft, IsHardware: false);
     }
+
+    /// <summary>
+    /// Unlocks async MFTs, applies low-latency codec settings, and negotiates types.
+    /// Order matters: an async MFT rejects most IMFTransform calls until unlocked.
+    /// </summary>
+    private void PrepareMft(IMFTransform mft)
+    {
+        mft.GetAttributes(out IMFAttributes attrs);
+        uint isAsync = 0;
+        try { attrs.GetUINT32(PInvoke.MF_TRANSFORM_ASYNC, out isAsync); }
+        catch (COMException) { }
+        if (isAsync != 0)
+        {
+            attrs.SetUINT32(PInvoke.MF_TRANSFORM_ASYNC_UNLOCK, 1);
+            _eventGen = (IMFMediaEventGenerator)mft;
+        }
+
+        // Rate-control settings must be applied AFTER the output type is set —
+        // SetOutputType otherwise resets them, so an earlier CBR request is lost.
+        SetupTypesOn(mft);
+        TryConfigureCodec(mft);
+    }
+
+    // Best-effort ICodecAPI configuration. An encoder that rejects any of these
+    // still works, just with more latency or a looser bitrate.
+    private void TryConfigureCodec(IMFTransform mft)
+    {
+        if (mft is not ICodecAPI api)
+        {
+            Trace.WriteLine("[Montogo.Encoding] MFT does not expose ICodecAPI — no rate control applied");
+            return;
+        }
+        _codecApi = api;   // retained so RequestKeyFrame can force an IDR later
+
+        void Set(string name, Guid key, object value)
+        {
+            int hr = api.SetValue(key, ref value);
+            if (hr != 0) Trace.WriteLine($"[Montogo.Encoding] ICodecAPI {name} rejected (0x{hr:X8})");
+        }
+
+        // Constant bitrate: without this the NVENC MFT treats MF_MT_AVG_BITRATE as a
+        // soft hint and lets high-entropy frames balloon to ~170 Mbps.  CBR + a tight
+        // VBV buffer keeps every frame near budget.
+        Set("RateControlMode=CBR", CodecApiGuids.AVEncCommonRateControlMode, 0u);
+        Set("MeanBitRate",         CodecApiGuids.AVEncCommonMeanBitRate, (uint)_options.BitrateBps);
+        Set("MaxBitRate",          CodecApiGuids.AVEncCommonMaxBitRate, (uint)_options.BitrateBps);
+        Set("BufferSize",          CodecApiGuids.AVEncCommonBufferSize, (uint)(_options.BitrateBps / 4));
+        Set("LowLatencyMode",      CodecApiGuids.AVLowLatencyMode, true);
+        Set("QualityVsSpeed",      CodecApiGuids.AVEncCommonQualityVsSpeed, 0u);
+        // (Keyframe interval is set on the output media type — see SetupTypesOn.
+        //  The NVENC MFT ignores both that and the ICodecAPI GOP-size property and
+        //  always emits ~1 keyframe/sec, so a shorter GOP can't be forced here.)
+    }
+
+    /// <summary>
+    /// Requests that the next submitted frame be encoded as a keyframe (IDR).
+    /// Thread-safe — call from any thread (e.g. when a Mac connects) so a new
+    /// client can start decoding immediately without waiting for the long GOP.
+    /// </summary>
+    public void RequestKeyFrame() => Interlocked.Exchange(ref _forceKeyframe, 1);
 
     private void SetupTypesOn(IMFTransform mft)
     {
@@ -122,6 +245,11 @@ public sealed class H264Encoder : IDisposable
         outputType.SetUINT32(PInvoke.MF_MT_AVG_BITRATE, (uint)_options.BitrateBps);
         outputType.SetUINT32(PInvoke.MF_MT_INTERLACE_MODE, 2); // MFVideoInterlaceMode_Progressive
         outputType.SetUINT64(PInvoke.MF_MT_PIXEL_ASPECT_RATIO, PackRatio(1, 1));
+        // Long keyframe interval. The NVENC MFT ignores this (it always emits ~1
+        // keyframe/sec), but the Microsoft software fallback honours it — fewer
+        // keyframes there means fewer ~200-packet bursts. A keyframe is forced on
+        // connect (RequestKeyFrame) for fast startup regardless of the interval.
+        outputType.SetUINT32(PInvoke.MF_MT_MAX_KEYFRAME_SPACING, (uint)(_options.Fps * 4));
         mft.SetOutputType(0, outputType, 0);
 
         PInvoke.MFCreateMediaType(out IMFMediaType inputType).ThrowOnFailure();
@@ -142,6 +270,13 @@ public sealed class H264Encoder : IDisposable
     {
         if (!_started) throw new InvalidOperationException("Not initialized.");
 
+        // Honour a pending keyframe request before the frame is fed to the encoder.
+        if (Interlocked.Exchange(ref _forceKeyframe, 0) == 1 && _codecApi is not null)
+        {
+            try { object one = 1u; _codecApi.SetValue(CodecApiGuids.AVEncVideoForceKeyFrame, ref one); }
+            catch { }
+        }
+
         BgraToNv12(bgraData, _nv12!, _options.Width, _options.Height);
 
         uint nv12Size = (uint)_nv12!.Length;
@@ -156,69 +291,125 @@ public sealed class H264Encoder : IDisposable
         sample.SetSampleTime(timestampUs * 10); // µs → 100-ns units
         sample.SetSampleDuration(_frameDurationHns);
 
-        _encoder!.ProcessInput(0, sample, 0);
-        DrainOutputs();
+        if (_eventGen is not null)
+        {
+            // Async MFT: ProcessInput is only legal after a NeedInput event.
+            // Service output events while waiting for input credit.
+            while (_pendingNeedInput == 0)
+                PumpOneEvent(blocking: true);
+
+            _encoder!.ProcessInput(0, sample, 0);
+            _pendingNeedInput--;
+
+            // Drain whatever the encoder has already queued, without blocking.
+            while (PumpOneEvent(blocking: false)) { }
+        }
+        else
+        {
+            _encoder!.ProcessInput(0, sample, 0);
+            while (DrainOne()) { }
+        }
     }
 
-    private unsafe void DrainOutputs()
+    /// <returns>false when the event queue was empty (non-blocking mode only).</returns>
+    private bool PumpOneEvent(bool blocking)
+    {
+        IMFMediaEvent evt;
+        var flags = (MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS)(blocking ? 0 : MF_EVENT_FLAG_NO_WAIT);
+        try { _eventGen!.GetEvent(flags, out evt); }
+        catch (COMException ex) when (ex.HResult == MF_E_NO_EVENTS_AVAILABLE) { return false; }
+
+        evt.GetType(out uint eventType);
+        if      (eventType == METransformNeedInput)  _pendingNeedInput++;
+        else if (eventType == METransformHaveOutput) DrainOne();
+        return true;
+    }
+
+    /// <returns>false when the MFT needs more input before it can produce output.</returns>
+    private unsafe bool DrainOne()
     {
         var outputs = new MFT_OUTPUT_DATA_BUFFER[1];
-        while (true)
+        // pSample is null when the MFT provides its own output samples (hardware).
+        outputs[0] = new MFT_OUTPUT_DATA_BUFFER { dwStreamID = 0, pSample = _reusableOutputSample! };
+        try { _encoder!.ProcessOutput(0, 1, outputs, out _); }
+        catch (COMException ex) when (ex.HResult == MF_E_TRANSFORM_NEED_MORE_INPUT) { return false; }
+
+        IMFSample outSample = outputs[0].pSample;
+        if (outSample is null) return true;
+
+        bool isKeyFrame;
+        try { outSample.GetUINT32(PInvoke.MFSampleExtension_CleanPoint, out uint v); isKeyFrame = v != 0; }
+        catch (COMException) { isKeyFrame = false; }
+
+        outSample.GetSampleTime(out long sampleTimeHns);
+        outSample.ConvertToContiguousBuffer(out IMFMediaBuffer outBuffer);
+
+        outBuffer.Lock(out byte* ptr, out uint maxLen, out uint curLen);
+        byte[] data = new byte[curLen];
+        try { new ReadOnlySpan<byte>(ptr, (int)curLen).CopyTo(data); }
+        finally { outBuffer.Unlock(); }
+
+        // Hardware-provided samples must be released back to the MFT's pool.
+        if (_reusableOutputSample is null)
         {
-            outputs[0] = new MFT_OUTPUT_DATA_BUFFER { dwStreamID = 0 }; // pSample = null → MFT allocates
-            try { _encoder!.ProcessOutput(0, 1, outputs, out _); }
-            catch (COMException ex) when (ex.HResult == MF_E_TRANSFORM_NEED_MORE_INPUT) { break; }
-
-            IMFSample outSample = outputs[0].pSample;
-            if (outSample is null) continue;
-
-            bool isKeyFrame;
-            try { outSample.GetUINT32(PInvoke.MFSampleExtension_CleanPoint, out uint v); isKeyFrame = v != 0; }
-            catch (COMException) { isKeyFrame = false; }
-
-            outSample.GetSampleTime(out long sampleTimeHns);
-            outSample.ConvertToContiguousBuffer(out IMFMediaBuffer outBuffer);
-
-            outBuffer.Lock(out byte* ptr, out uint maxLen, out uint curLen);
-            byte[] data = new byte[curLen];
-            try { new ReadOnlySpan<byte>(ptr, (int)curLen).CopyTo(data); }
-            finally { outBuffer.Unlock(); }
-
-            FrameEncoded?.Invoke(new EncodedFrame
-            {
-                Data        = data,
-                IsKeyFrame  = isKeyFrame,
-                TimestampUs = sampleTimeHns / 10,
-            });
+            Marshal.ReleaseComObject(outBuffer);
+            Marshal.ReleaseComObject(outSample);
         }
+
+        FrameEncoded?.Invoke(new EncodedFrame
+        {
+            Data        = data,
+            IsKeyFrame  = isKeyFrame,
+            TimestampUs = sampleTimeHns / 10,
+        });
+        return true;
     }
 
     // ── Color conversion ─────────────────────────────────────────────────────
 
     // BT.601 limited range, integer approximation.
     // UV sampled from top-left pixel of each 2×2 block.
-    private static void BgraToNv12(ReadOnlySpan<byte> bgra, byte[] nv12, int width, int height)
+    // Unsafe pointers + Parallel.For over row pairs: the scalar managed version took
+    // tens of ms per 1080p frame, which alone dropped the stream below target fps.
+    private static unsafe void BgraToNv12(ReadOnlySpan<byte> bgra, byte[] nv12, int width, int height)
     {
-        int yPlaneSize = width * height;
-
-        for (int row = 0; row < height; row++)
-        for (int col = 0; col < width;  col++)
+        fixed (byte* bgraPtr = bgra)
+        fixed (byte* nv12Ptr = nv12)
         {
-            int i = (row * width + col) * 4;
-            int b = bgra[i], g = bgra[i + 1], r = bgra[i + 2];
-            nv12[row * width + col] = (byte)(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
-        }
+            // Lambdas cannot capture pointers, so smuggle them through as nint.
+            nint srcAddr = (nint)bgraPtr;
+            nint dstAddr = (nint)nv12Ptr;
+            int  w = width;
 
-        for (int row = 0; row < height; row += 2)
-        for (int col = 0; col < width;  col += 2)
-        {
-            int i = (row * width + col) * 4;
-            int b = bgra[i], g = bgra[i + 1], r = bgra[i + 2];
-            int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-            int v = ((112 * r - 94 * g -  18 * b + 128) >> 8) + 128;
-            int idx = yPlaneSize + (row / 2) * width + col;
-            nv12[idx]     = (byte)Math.Clamp(u, 0, 255);
-            nv12[idx + 1] = (byte)Math.Clamp(v, 0, 255);
+            Parallel.For(0, height / 2, rowPair =>
+            {
+                int row0 = rowPair * 2;
+                byte* s0 = (byte*)srcAddr + (long)row0 * w * 4;
+                byte* s1 = s0 + w * 4;
+                byte* y0 = (byte*)dstAddr + (long)row0 * w;
+                byte* y1 = y0 + w;
+                byte* uv = (byte*)dstAddr + (long)w * (height + rowPair);
+
+                for (int col = 0; col < w; col += 2)
+                {
+                    int b00 = s0[0], g00 = s0[1], r00 = s0[2];
+                    int b01 = s0[4], g01 = s0[5], r01 = s0[6];
+                    int b10 = s1[0], g10 = s1[1], r10 = s1[2];
+                    int b11 = s1[4], g11 = s1[5], r11 = s1[6];
+
+                    y0[0] = (byte)(((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16);
+                    y0[1] = (byte)(((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16);
+                    y1[0] = (byte)(((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16);
+                    y1[1] = (byte)(((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16);
+
+                    int u = ((-38 * r00 - 74 * g00 + 112 * b00 + 128) >> 8) + 128;
+                    int v = ((112 * r00 - 94 * g00 -  18 * b00 + 128) >> 8) + 128;
+                    uv[0] = (byte)Math.Clamp(u, 0, 255);
+                    uv[1] = (byte)Math.Clamp(v, 0, 255);
+
+                    s0 += 8; s1 += 8; y0 += 2; y1 += 2; uv += 2;
+                }
+            });
         }
     }
 

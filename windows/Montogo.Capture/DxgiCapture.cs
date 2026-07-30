@@ -22,6 +22,9 @@ public sealed class DxgiCapture : IDisposable
 
     public Action<CapturedFrame>? FrameCaptured;
 
+    /// <summary>Fires when the capture thread dies from an unhandled exception.</summary>
+    public Action<Exception>? CaptureFailed;
+
     public DxgiCapture(CaptureOptions options) => _options = options;
 
     public static IReadOnlyList<DisplayInfo> EnumerateDisplays()
@@ -60,7 +63,11 @@ public sealed class DxgiCapture : IDisposable
     {
         if (_cts != null) throw new InvalidOperationException("Already started.");
         _cts = new CancellationTokenSource();
-        _thread = new Thread(() => CaptureLoop(_cts.Token)) { IsBackground = true, Name = "DxgiCapture" };
+        _thread = new Thread(() =>
+        {
+            try { CaptureLoop(_cts.Token); }
+            catch (Exception ex) { CaptureFailed?.Invoke(ex); }
+        }) { IsBackground = true, Name = "DxgiCapture" };
         _thread.Start();
     }
 
@@ -155,11 +162,38 @@ public sealed class DxgiCapture : IDisposable
             var frameData = new byte[width * height * 4];
             int timeoutMs = 1000 / Math.Max(1, _options.TargetFps);
 
+            // DXGI only delivers frames when desktop content changes.  On a static
+            // desktop AcquireNextFrame times out forever, which would starve the
+            // stream and trip the Mac's connection watchdog — so on timeout (or a
+            // cursor-only update) the previous frame is re-emitted at the target fps.
+            // lastFrame is always the CLEAN desktop (no cursor); the cursor is
+            // composited per emit so it can move over a static desktop.
+            byte[]? lastFrame   = null;
+            byte[]? lastEmitted = null;
+            long    lastEmitMs  = 0;
+
+            // Cursor state, updated from DXGI pointer info on each acquired frame.
+            var  cursorShape     = Array.Empty<byte>();
+            DXGI_OUTDUPL_POINTER_SHAPE_INFO cursorShapeInfo = default;
+            bool cursorVisible = false;
+            int  cursorX = 0, cursorY = 0;
+            bool cursorDirty = false;
+
+            byte[] ComposeEmit()
+            {
+                if (!cursorVisible || cursorShape.Length == 0) return lastFrame!;
+                byte[] buf = new byte[lastFrame!.Length];
+                lastFrame.AsSpan().CopyTo(buf);
+                DrawCursor(buf, width, height, cursorShape, in cursorShapeInfo, cursorX, cursorY);
+                return buf;
+            }
+
             while (!ct.IsCancellationRequested)
             {
                 DXGI_OUTDUPL_FRAME_INFO frameInfo = default;
                 IDXGIResource           resource  = default!;
-                bool hasFrame = false;
+                bool hasFrame      = false;
+                bool gotNewContent = false;
 
                 try
                 {
@@ -170,24 +204,73 @@ public sealed class DxgiCapture : IDisposable
                     }
                     catch (COMException ex) when (ex.HResult == E_DXGI_WAIT_TIMEOUT)
                     {
-                        continue;
                     }
                     catch (COMException ex) when (ex.HResult == E_DXGI_ACCESS_LOST)
                     {
                         throw new InvalidOperationException("Desktop duplication lost (display mode changed).", ex);
                     }
 
-                    // Skip frames with no new desktop content (e.g. cursor-only updates)
-                    if (frameInfo.LastPresentTime == 0)
-                        continue;
+                    if (hasFrame)
+                    {
+                        // Position/visibility (only valid when the mouse actually updated)
+                        if (frameInfo.LastMouseUpdateTime != 0)
+                        {
+                            bool visible = frameInfo.PointerPosition.Visible;
+                            int  px = frameInfo.PointerPosition.Position.X;
+                            int  py = frameInfo.PointerPosition.Position.Y;
+                            if (visible != cursorVisible || px != cursorX || py != cursorY)
+                            {
+                                cursorVisible = visible;
+                                cursorX = px;
+                                cursorY = py;
+                                cursorDirty = true;
+                            }
+                        }
 
-                    var desktop = (ID3D11Texture2D)resource;
-                    context.CopyResource((ID3D11Resource)staging, (ID3D11Resource)desktop);
+                        // New shape (must be fetched while the frame is still acquired)
+                        if (frameInfo.PointerShapeBufferSize > 0)
+                        {
+                            if (cursorShape.Length < frameInfo.PointerShapeBufferSize)
+                                cursorShape = new byte[frameInfo.PointerShapeBufferSize];
+                            duplication.GetFramePointerShape(
+                                cursorShape.AsSpan(), out uint _, out cursorShapeInfo);
+                            cursorDirty = true;
+                        }
+                    }
+
+                    // LastPresentTime == 0 means no new desktop image (cursor-only
+                    // update) — except the very first frame, which must seed the stream.
+                    gotNewContent = hasFrame && (frameInfo.LastPresentTime != 0 || lastFrame is null);
+
+                    if (gotNewContent)
+                    {
+                        var desktop = (ID3D11Texture2D)resource;
+                        context.CopyResource((ID3D11Resource)staging, (ID3D11Resource)desktop);
+                    }
                 }
                 finally
                 {
                     if (hasFrame)
                         duplication.ReleaseFrame();
+                }
+
+                if (!gotNewContent)
+                {
+                    // Emitted buffers are never mutated after creation, so re-emitting
+                    // one is safe under the receiver-owns-the-buffer contract; only a
+                    // cursor change forces a fresh composite.
+                    long nowMs = Environment.TickCount64;
+                    if (lastFrame is not null && nowMs - lastEmitMs >= timeoutMs)
+                    {
+                        lastEmitMs = nowMs;
+                        if (cursorDirty || lastEmitted is null)
+                        {
+                            lastEmitted = ComposeEmit();
+                            cursorDirty = false;
+                        }
+                        FrameCaptured?.Invoke(new CapturedFrame { BgraData = lastEmitted, Width = width, Height = height });
+                    }
+                    continue;
                 }
 
                 context.Map((ID3D11Resource)staging, 0, D3D11_MAP.D3D11_MAP_READ, 0, out D3D11_MAPPED_SUBRESOURCE mapped);
@@ -220,7 +303,11 @@ public sealed class DxgiCapture : IDisposable
                 // safe to hold across threads, matching the contract in CapturedFrame.cs.
                 byte[] frameCopy = new byte[frameData.Length];
                 frameData.AsSpan().CopyTo(frameCopy);
-                FrameCaptured?.Invoke(new CapturedFrame { BgraData = frameCopy, Width = width, Height = height });
+                lastFrame   = frameCopy;
+                lastEmitted = ComposeEmit();
+                cursorDirty = false;
+                lastEmitMs  = Environment.TickCount64;
+                FrameCaptured?.Invoke(new CapturedFrame { BgraData = lastEmitted, Width = width, Height = height });
             }
         }
         finally
@@ -233,6 +320,105 @@ public sealed class DxgiCapture : IDisposable
             if (targetOutput  is not null) Marshal.ReleaseComObject(targetOutput);
             if (targetAdapter is not null) Marshal.ReleaseComObject(targetAdapter);
             Marshal.ReleaseComObject(factory);
+        }
+    }
+
+    // ── Cursor compositing ───────────────────────────────────────────────────
+
+    private const uint PointerShapeMonochrome  = 1; // DXGI_OUTDUPL_POINTER_SHAPE_TYPE_*
+    private const uint PointerShapeColor       = 2;
+    private const uint PointerShapeMaskedColor = 4;
+
+    /// <summary>
+    /// Draws the DXGI pointer shape onto a BGRA frame at (px, py), clipped to the
+    /// frame bounds.  Desktop duplication never composites the hardware cursor into
+    /// captured frames, so it must be drawn manually before encoding.
+    /// </summary>
+    private static void DrawCursor(
+        byte[] dst, int frameW, int frameH,
+        byte[] shape, in DXGI_OUTDUPL_POINTER_SHAPE_INFO info, int px, int py)
+    {
+        uint type  = info.Type;
+        int  w     = (int)info.Width;
+        int  pitch = (int)info.Pitch;
+        // Monochrome shapes stack the AND mask on top of the XOR mask, so the
+        // reported height covers both.
+        int h = (int)(type == PointerShapeMonochrome ? info.Height / 2 : info.Height);
+
+        for (int y = 0; y < h; y++)
+        {
+            int fy = py + y;
+            if ((uint)fy >= (uint)frameH) continue;
+
+            for (int x = 0; x < w; x++)
+            {
+                int fx = px + x;
+                if ((uint)fx >= (uint)frameW) continue;
+
+                int di = (fy * frameW + fx) * 4;
+
+                switch (type)
+                {
+                    case PointerShapeColor:
+                    {
+                        int si = y * pitch + x * 4;
+                        int a  = shape[si + 3];
+                        if (a == 0) break;
+                        if (a == 255)
+                        {
+                            dst[di]     = shape[si];
+                            dst[di + 1] = shape[si + 1];
+                            dst[di + 2] = shape[si + 2];
+                        }
+                        else
+                        {
+                            dst[di]     = (byte)((shape[si]     * a + dst[di]     * (255 - a)) / 255);
+                            dst[di + 1] = (byte)((shape[si + 1] * a + dst[di + 1] * (255 - a)) / 255);
+                            dst[di + 2] = (byte)((shape[si + 2] * a + dst[di + 2] * (255 - a)) / 255);
+                        }
+                        break;
+                    }
+                    case PointerShapeMaskedColor:
+                    {
+                        // Alpha byte is a mask: 0 → replace with the shape colour,
+                        // 0xFF → XOR the shape colour with the screen.
+                        int si = y * pitch + x * 4;
+                        if (shape[si + 3] == 0)
+                        {
+                            dst[di]     = shape[si];
+                            dst[di + 1] = shape[si + 1];
+                            dst[di + 2] = shape[si + 2];
+                        }
+                        else
+                        {
+                            dst[di]     ^= shape[si];
+                            dst[di + 1] ^= shape[si + 1];
+                            dst[di + 2] ^= shape[si + 2];
+                        }
+                        break;
+                    }
+                    case PointerShapeMonochrome:
+                    {
+                        // 1 bpp: AND mask rows first, then XOR mask rows.
+                        // and=1,xor=0 → transparent; and=0 → solid black/white;
+                        // and=1,xor=1 → invert the screen pixel.
+                        int  bit = 0x80 >> (x & 7);
+                        bool and = (shape[y * pitch + (x >> 3)]       & bit) != 0;
+                        bool xor = (shape[(y + h) * pitch + (x >> 3)] & bit) != 0;
+                        if (and && !xor) break;
+                        if (!and)
+                        {
+                            byte v = xor ? (byte)255 : (byte)0;
+                            dst[di] = v; dst[di + 1] = v; dst[di + 2] = v;
+                        }
+                        else
+                        {
+                            dst[di] ^= 255; dst[di + 1] ^= 255; dst[di + 2] ^= 255;
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
 

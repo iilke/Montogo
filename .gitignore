@@ -22,3 +22,6 @@ Thumbs.db
 mac/.build/
 mac/*.xcodeproj/xcuserdata/
 mac/*.xcworkspace/xcuserdata/
+
+# Third-party virtual-display-rs CLI (provided per-machine, not committed)
+windows/Montogo.App/driver/

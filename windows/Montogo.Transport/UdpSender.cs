@@ -27,13 +27,26 @@ public sealed class UdpSender : IDisposable
 {
     private static readonly int HeaderSize = Marshal.SizeOf<VideoChunkHeader>();
 
-    private readonly UdpClient _client      = new();
+    private readonly UdpClient _client;
+    private readonly bool      _ownsClient;
     private readonly AesGcm    _cipher;
     private readonly byte[]    _noncePrefix = RandomNumberGenerator.GetBytes(8);
     private IPEndPoint? _target;
     private uint        _sequenceNum;
 
-    public UdpSender(AesGcm cipher) => _cipher = cipher;
+    /// <param name="cipher">AES-GCM cipher shared with the handshake security context.</param>
+    /// <param name="sendSocket">
+    /// Optional existing UdpClient to reuse for sending.  When supplied the caller
+    /// retains ownership and UdpSender will not dispose it.  Use this to send video
+    /// from the same local port as the handshake listener so the Mac's stateful
+    /// firewall treats video as a reply to the outbound handshake packet.
+    /// </param>
+    public UdpSender(AesGcm cipher, UdpClient? sendSocket = null)
+    {
+        _cipher     = cipher;
+        _client     = sendSocket ?? new UdpClient();
+        _ownsClient = sendSocket is null;
+    }
 
     /// <summary>
     /// The 8-byte per-session nonce prefix as a little-endian uint64, ready for
@@ -120,5 +133,5 @@ public sealed class UdpSender : IDisposable
         return HeaderSize + chunkLen + ProtocolConstants.GcmTagSize;
     }
 
-    public void Dispose() => _client.Dispose();
+    public void Dispose() { if (_ownsClient) _client.Dispose(); }
 }

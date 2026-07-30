@@ -28,8 +28,10 @@ Montogo/
     Montogo.Transport/  — UDP chunked sender
     Montogo.Protocol/   — shared packet structs + canonical spec
     Montogo.Tests/      — xUnit test project
-  mac/                  — Swift app (not yet started)
-  DECISIONS.md          — this file
+  mac/Montogo/          — Swift app (SwiftUI + Metal receiver, working)
+  README.md             — user-facing setup + limitations
+  ARCHITECTURE.md       — technical pipeline/security/component overview
+  DECISIONS.md          — this file (per-component detail + rationale)
 ```
 
 ---
@@ -107,7 +109,7 @@ Implemented in `Montogo.App/CliPathResolver.cs`. `DriverLocator.TryFindRelative(
 
 ## Montogo.App
 
-**Entry point:** `Program.cs` → `Application.Run(new TrayApplicationContext())`.
+**Entry point:** `Program.cs` → `Application.Run(new TrayApplicationContext())`. A named mutex (`Local\MontogoApp`) enforces a single instance — multiple instances fight over UDP port 47921 and the virtual display, and the losers sit in the tray with stale state.
 
 **`TrayApplicationContext`:** WinForms `ApplicationContext` subclass. Owns the `NotifyIcon` and wires the full pipeline. Lifecycle on startup (`InitAsync`):
 
@@ -116,7 +118,9 @@ Implemented in `Montogo.App/CliPathResolver.cs`. `DriverLocator.TryFindRelative(
 3. Poll DXGI for up to 3 s (20 × 150 ms) for the new display to appear.
 4. Probe for a hardware H.264 encoder (`H264Encoder.IsHardwareEncoderAvailable()`); set fps/bitrate accordingly.
 5. Enter `HandshakeLoopAsync` — bind UDP to the LAN IP, wait for the Mac.
-6. On a valid authenticated handshake: create `UdpSender`, send `HandshakeResponse` (with nonce prefix), call `StartPipeline`.
+6. On a valid authenticated handshake: create `UdpSender` **sharing the listener socket** (see Transport — video must leave from source port 47921 or the Mac's stateful firewall drops it), send `HandshakeResponse` (with nonce prefix), call `StartPipeline`.
+
+`StartPipeline` also wires `DxgiCapture.CaptureFailed` → tray status, so a capture-thread crash (e.g. `DXGI_ERROR_ACCESS_LOST`) is visible instead of silently starving the stream. Pipeline-task exceptions surface the same way via a catch in `PipelineLoopAsync`.
 
 On exit (`ExitApplication`): cancel the CTS, stop capture, complete the channel, drain the pipeline task (2 s timeout), dispose encoder and sender, call `RemoveAllAsync`.
 
@@ -126,7 +130,11 @@ On exit (`ExitApplication`): cancel the CTS, stop capture, complete the channel,
 
 **`CliPathResolver`:** resolution order: (1) `driver\virtual-display-driver-cli.exe` next to the exe, (2) `DriverCliPath` in settings. Validates that the settings path ends with `DriverLocator.CliName` (case-insensitive) before accepting it.
 
-**DoS protection:** once the pipeline is running, all further `HandshakeRequest` packets are dropped silently (`if (_capture is not null) continue`). A new session requires restarting the app.
+**Handshake acceptance (token first, then session state):** every `HandshakeRequest` is token-validated *before* anything else, so an unauthenticated flood never reaches the pipeline (the anti-DoS property). Then:
+
+- **Invalid token** → dropped. While not yet streaming, the tray shows `Wrong code from <ip>` so a mistyped code is visible instead of a silent hang (local only; nothing sent on the wire).
+- **Valid token, `_capture is null`** → start the pipeline, reply with `HandshakeResponse`.
+- **Valid token, `_capture is not null`** (relaunched Mac with a new `ClientId`, or a reconnect) → **re-handshake**: re-target the running `_sender`, resend the response with the *existing* `NoncePrefix`, and call `_encoder.RequestKeyFrame()` so the new client decodes immediately. No pipeline restart. Earlier this path dropped all handshakes once running, which meant a relaunched Mac hung on "Connecting…" forever — the re-handshake replaced that. Tradeoff: a party who knows the code can redirect the stream mid-session; acceptable under the trusted-LAN + shared-secret threat model.
 
 ---
 
@@ -135,9 +143,10 @@ On exit (`ExitApplication`): cancel the CTS, stop capture, complete the channel,
 ### Design
 
 - **Display selection:** `CaptureOptions.OutputIndex` is a global index matching the order from `DxgiCapture.EnumerateDisplays()`. Enumeration walks adapters via `IDXGIFactory1.EnumAdapters1` (outer), then outputs via `IDXGIAdapter.EnumOutputs` (inner), assigning sequential global indices. Both methods have `[PreserveSig]` and return `HRESULT` directly — check `.Value == 0x887A0002` for end-of-enumeration.
-- **Frame delivery:** `Action<CapturedFrame>? FrameCaptured` callback, fired on the capture thread. Consumer must be fast or hand off immediately.
+- **Frame delivery:** `Action<CapturedFrame>? FrameCaptured` callback, fired on the capture thread. Consumer must be fast or hand off immediately. `Action<Exception>? CaptureFailed` fires if the capture thread dies — without it a dead thread just silently stops producing frames.
 - **Frame format:** raw BGRA bytes (`DXGI_FORMAT_B8G8R8A8_UNORM`) via CPU staging texture. Row-pitch padding is handled (copies row-by-row if `RowPitch != width * 4`).
-- **Cursor-only frames are skipped:** `DXGI_OUTDUPL_FRAME_INFO.LastPresentTime == 0` means no new desktop content; `ReleaseFrame` is still called but the frame is not emitted.
+- **Static-desktop re-emit:** DXGI only delivers frames when desktop content *changes* — on an idle desktop `AcquireNextFrame` times out forever, which starved the stream and tripped the Mac's 3-second connection watchdog. On timeout (or a cursor-only update, `LastPresentTime == 0`) the loop re-emits the previous frame, paced to the target fps. The very first frame is captured even when flagged as no-new-content so the stream can seed from a static desktop.
+- **Cursor compositing:** Desktop Duplication never draws the hardware cursor into the captured image; position/visibility come from `DXGI_OUTDUPL_FRAME_INFO.PointerPosition` and the bitmap from `GetFramePointerShape` (which must be called while the frame is still acquired). The loop keeps `lastFrame` as the *clean* desktop and composites the cursor per emit, so a cursor moving over a static desktop is redrawn at its new position rather than baked in. All three DXGI shape formats are handled: color (alpha blend), masked color (replace/XOR), monochrome AND/XOR masks (the text I-beam). Visibility is per-output — when the mouse is on another monitor DXGI reports it invisible here, and nothing is drawn.
 - **`[SupportedOSPlatform("windows8.0")]`** on `DxgiCapture` — DXGI Desktop Duplication requires Win 8+.
 
 ### Key API notes (CsWin32 0.3.298)
@@ -201,7 +210,7 @@ Canonical spec lives in `windows/Montogo.Protocol/PROTOCOL.md`. The Swift side i
 | Transport | UDP unicast |
 | Byte order | Little-endian throughout |
 | Windows listen port | 47921 (video stream + handshake) |
-| Discovery | mDNS service type `_montogo._udp.local.` |
+| Discovery | manual — user types the Windows LAN IP (mDNS planned, not implemented) |
 | Max chunk payload | 1400 bytes plaintext (wire payload = plaintext + 16-byte GCM tag) |
 
 ### Packet types
@@ -262,11 +271,11 @@ Every `VideoChunk` payload is encrypted with AES-256-GCM (16-byte tag). Nonce = 
 
 ## Montogo.Encoding
 
-H.264 encoder via MediaFoundation MFT with a hardware GPU fallback chain. `IsHardwareEncoderAvailable()` is called at startup (before pipeline start) to decide fps and bitrate. The result determines what `TrayApplicationContext` advertises in the `HandshakeResponse`.
+H.264 encoder via MediaFoundation MFT with hardware detection. `IsHardwareEncoderAvailable()` is called at startup (before pipeline start) to decide fps and bitrate. The result determines what `TrayApplicationContext` advertises in the `HandshakeResponse`.
 
 | Path | Encoder | fps | Bitrate |
 |---|---|---|---|
-| Hardware | NVENC → Quick Sync → AMF (first available) | 60 | 10 Mbps |
+| Hardware | First hardware H.264 MFT from `MFTEnumEx` (NVENC / Quick Sync / AMF, whatever the GPU driver registered) | 60 | 10 Mbps |
 | Software fallback | Microsoft H.264 MFT (always present on Win 7+) | 30 | 5 Mbps |
 
 ### API surface
@@ -279,19 +288,24 @@ var enc = new H264Encoder(new EncoderOptions(Width, Height, Fps, BitrateBps));
 enc.FrameEncoded += frame => { /* frame.Data, frame.IsKeyFrame, frame.TimestampUs */ };
 enc.Initialize();
 bool isHW = enc.IsHardwareAccelerated; // true if a GPU encoder was selected
-enc.SubmitFrame(bgraSpan, timestampUs); // synchronous; fires FrameEncoded inline
+enc.SubmitFrame(bgraSpan, timestampUs); // synchronous; fires FrameEncoded inline during drain
+enc.RequestKeyFrame();                  // thread-safe; forces the next frame to be an IDR
 enc.Dispose();
 ```
 
 ### Key decisions
 
-- **Hardware fallback chain:** `CreateEncoder` tries each CLSID in order (NVENC, Quick Sync, AMF) via `Type.GetTypeFromCLSID` + `Activator.CreateInstance` + `SetupTypesOn`. If the MFT instantiates but rejects the media types (wrong driver, unsupported resolution), `SetupTypesOn` throws and the next candidate is tried. Microsoft software MFT is the guaranteed final fallback.
-- **MFT instantiation via CLSID:** avoids `MFTEnumEx` and the `IMFActivate_unmanaged**` complexity. One CLSID probe = one `try/catch`; cheap enough to do at startup.
-- **Type negotiation order:** output type (H.264) must be set before input type (NV12). MFT rejects the reverse order.
-- **Color conversion:** BGRA→NV12 in C# on CPU (BT.601 limited-range integer math). UV plane is sampled from the top-left pixel of each 2×2 block (fast; good enough for H.264 at screen-sharing quality).
-- **CsWin32 pattern:** `IMFAttributes_Extensions` provides managed `(in Guid key, ...)` wrappers for `SetGUID`/`SetUINT32`/`SetUINT64` on both `IMFMediaType` and `IMFSample` (both inherit `IMFAttributes`). Lock/Unlock via `IMFMediaBuffer_Extensions`.
-- **Output drain:** after each `ProcessInput`, loop `ProcessOutput` until `COMException(0xC00D6D72)` (`MF_E_TRANSFORM_NEED_MORE_INPUT`). `pSample = null` in `MFT_OUTPUT_DATA_BUFFER` tells the MFT to allocate its own output buffer.
+- **Hardware detection via `MFTEnumEx`:** `MFT_CATEGORY_VIDEO_ENCODER` + `MFT_ENUM_FLAG_HARDWARE | SORTANDFILTER`, output type H.264 — finds whatever encoder MFT the GPU driver registered, no vendor CLSIDs. (An earlier version hard-coded NVENC/QSV/AMF CLSIDs; the NVENC one was wrong, so an RTX 3070 silently fell back to software 30 fps.) The enumeration returns `IMFActivate_unmanaged**`; each raw pointer is `Marshal.Release`d and the array `FreeCoTaskMem`'d after activating the first entry. Microsoft software MFT (`Type.GetTypeFromCLSID`) is the guaranteed final fallback if enumeration finds nothing or the hardware MFT rejects our config.
+- **Async MFT support:** hardware encoder MFTs are *async* transforms — they reject `ProcessInput`/`ProcessOutput` until `MF_TRANSFORM_ASYNC_UNLOCK` is set on their attributes, and must then be driven by their event queue (`IMFMediaEventGenerator`). `SubmitFrame` waits for `METransformNeedInput` credit (servicing `METransformHaveOutput` events while blocked), calls `ProcessInput`, then drains queued events non-blocking (`MF_EVENT_FLAG_NO_WAIT`, break on `MF_E_NO_EVENTS_AVAILABLE`). A `_pendingNeedInput` counter carries input credit popped during the drain phase across to the next frame. The software MFT is synchronous and keeps the plain ProcessInput → drain loop.
+- **Low latency via `ICodecAPI`:** `CODECAPI_AVLowLatencyMode = TRUE` and `AVEncCommonQualityVsSpeed = 0` (fastest) are set best-effort before type negotiation. Without this the software MFT buffers several frames for rate-control lookahead — visible lag on an interactive display. CsWin32 0.3.298's metadata lacks `ICodecAPI`/`CODECAPI_*`, so `CodecApi.cs` declares a minimal manual `[ComImport]` interface (VARIANT passed as `[MarshalAs(UnmanagedType.Struct)] ref object`; `bool` → VT_BOOL, `uint` → VT_UI4).
+- **Type negotiation order:** output type (H.264) must be set before input type (NV12). MFT rejects the reverse order. Async unlock must happen before *any* type calls.
+- **Color conversion:** BGRA→NV12 in C# on CPU (BT.601 limited-range integer math), as an unsafe pointer loop parallelized over row pairs with `Parallel.For`, computing Y and UV in one pass. The original scalar span-indexed version took tens of ms per 1080p frame — by itself enough to sink the frame rate. Pointers can't be captured by lambdas, so they're smuggled through as `nint`.
+- **Output samples:** hardware MFTs advertise `MFT_OUTPUT_STREAM_PROVIDES_SAMPLES` and allocate their own (`pSample = null`); their returned samples/buffers are `Marshal.ReleaseComObject`'d after copy-out to return them to the MFT's pool. The Microsoft software MFT does *not* provide samples — passing null gets `E_INVALIDARG` — so a caller-allocated sample+buffer (sized from `GetOutputStreamInfo.cbSize`) is created once in `Initialize` and reused for every `ProcessOutput`.
+- **Output drain:** `DrainOne()` does a single `ProcessOutput`, returning false on `COMException(0xC00D6D72)` (`MF_E_TRANSFORM_NEED_MORE_INPUT`). Sync path loops it; async path calls it once per `METransformHaveOutput` event.
 - **Keyframe detection:** `outSample.GetUINT32(MFSampleExtension_CleanPoint)` on the output sample; wrapped in try-catch since the attribute is absent on non-IDR frames.
+- **Rate control (CBR) — applied *after* `SetOutputType`:** `MF_MT_AVG_BITRATE` alone is a soft hint the NVENC MFT ignores for complex content (it ballooned to ~170 Mbps → hundreds of packets/frame → WiFi flood). `TryConfigureCodec` sets, via `ICodecAPI`, `AVEncCommonRateControlMode = CBR`, `AVEncCommonMeanBitRate`/`MaxBitRate = target`, and a tight `AVEncCommonBufferSize` (≈250 ms VBV) that actually caps per-frame size. Order matters: these are applied **after** `SetupTypesOn`, because `SetOutputType` resets them. GUIDs are copied verbatim from the Windows SDK `codecapi.h` (an earlier hand-typed `MaxBitRate` GUID was wrong → `E_INVALIDARG`). All CBR GUIDs live in `CodecApi.cs`.
+- **Keyframe interval — NVENC ignores it.** Both `MF_MT_MAX_KEYFRAME_SPACING` (media type) and `CODECAPI_AVEncMPVGOPSize` (ICodecAPI) are set to a long value but the NVENC MFT ignores both and always emits ~1 keyframe/sec; only the software fallback honours the media-type spacing. So the once-per-second keyframe (a ~200-packet burst → a periodic latency blip) can't be tuned away on hardware.
+- **Force keyframe on connect:** `RequestKeyFrame()` sets a cross-thread flag; `SubmitFrame` applies `CODECAPI_AVEncVideoForceKeyFrame = 1` before the next `ProcessInput`. Called from the handshake re-connect path so a client with the long GOP still starts decoding immediately. (The very first frame after `Initialize` is already an IDR, so first connect needs no force.)
 
 ---
 
@@ -302,16 +316,18 @@ UDP chunked sender. Takes an encoded H.264 frame, splits it into ≤1400-byte pl
 ### API surface
 
 ```csharp
-// cipher comes from SecurityContext.Cipher; must be created before HandshakeResponse is sent
-var sender = new UdpSender(AesGcm cipher);
+// cipher comes from SecurityContext.Cipher; must be created before HandshakeResponse is sent.
+// Pass the handshake listener so video leaves from source port 47921 (see below).
+var sender = new UdpSender(AesGcm cipher, UdpClient? sendSocket = null);
 ulong prefix = sender.NoncePrefix; // include in HandshakeResponsePacket.NoncePrefix
 sender.SetTarget(new IPEndPoint(macIp, ProtocolConstants.VideoPort));
 await sender.SendFrameAsync(frame.Data, frameId, timestampUs, isIdr, ct);
-sender.Dispose();
+sender.Dispose(); // does not dispose a caller-supplied sendSocket
 ```
 
 ### Key decisions
 
+- **Video shares the handshake listener's socket:** `UdpSender` originally created its own unbound `UdpClient`, so video left Windows from a random ephemeral port. macOS's stateful firewall only allows replies from the address the Mac sent its handshake *to* (`WindowsIP:47921`) — video from `WindowsIP:random` was dropped silently, and the Mac's watchdog fired 3 s after every successful handshake. The caller now passes the bound listener; when supplied, the caller keeps ownership and `Dispose` leaves it alone.
 - **Single rented buffer per frame:** `ArrayPool<byte>.Shared.Rent(HeaderSize + MaxChunkPayload + GcmTagSize)` allocated once per `SendFrameAsync`, reused across all chunks, returned in `finally`.
 - **Span-across-await:** C# 12 forbids ref-struct locals across `await` points. All `Span<byte>` usage (header write, encrypt call) lives in a synchronous `BuildAndEncrypt` helper; `SendFrameAsync` awaits only the `UdpClient.SendAsync` call.
 - **`MemoryMarshal.Write`:** writes the `VideoChunkHeader` struct directly into the rented buffer. Safe because the struct is unmanaged `Pack=1` sequential.
@@ -350,10 +366,25 @@ Test classes that call DXGI APIs are attributed `[SupportedOSPlatform("windows8.
 
 ---
 
-## Decisions Not Yet Made
+## Mac App (mac/Montogo)
 
-- **Mac rendering:** Metal or just an `AVSampleBufferDisplayLayer` on top of a full-screen window.
-- **mDNS discovery implementation:** Bonjour on Mac, `DnsServiceRegister` or a library on Windows. Currently the Mac needs to know the Windows IP manually.
-- **Installer / distribution:** how the driver CLI gets bundled with the Windows app.
-- **ACCESS_LOST recovery:** `DxgiCapture` currently throws on `DXGI_ERROR_ACCESS_LOST` (display mode change). Production code should catch this, release and recreate the duplication object, and continue streaming.
-- **Mac app:** not started. PROTOCOL.md has the full implementation checklist for the Swift side.
+SwiftUI app implementing the receive side of PROTOCOL.md manually (no code sharing with Windows).
+
+- **Networking (`UDPReceiver`):** a Swift `actor` owning a single POSIX UDP socket (`Darwin.socket`/`bind`) bound to port 47921. One socket receives everything — HandshakeResponse and video — so there is no NWListener/NWConnection split (Network.framework's connection-oriented model fought the connectionless protocol). Handshake requests retry every 500 ms; a watchdog fires `.lost` after 3 s without a valid-header packet and resumes handshaking.
+- **Receive pipeline (ordered, low-latency):** the socket is non-blocking; the `DispatchSource` handler drains **every** queued datagram per wake-up into one batch (stamped with an arrival time) and yields it through an `AsyncStream` consumed by a single `.high`-priority pump task. This gives strict FIFO into the actor with one hop per batch instead of one unstructured `Task` per packet — which had no ordering guarantee, and out-of-order chunks completing frames out of order corrupt H.264 decode. Decrypt + reassemble run on the actor; decode is dispatched to a dedicated serial `DispatchQueue` (off the MainActor, which otherwise made every frame wait on UI work).
+- **Security:** `ConnectionCode` base-32-decodes the 8-char code to the 5-byte IKM; CryptoKit HKDF-SHA256 derives the same EncKey/AuthKey as Windows; `AuthToken` is HMAC-SHA256 over the raw `uuid_t` bytes (same layout as .NET `Guid.ToByteArray()`); `StreamDecryptor` rebuilds the 12-byte GCM nonce from the handshake's `NoncePrefix` + per-chunk `SequenceNum`.
+- **Decode (`H264Decoder`):** wraps `VTDecompressionSession` with `_EnableAsynchronousDecompression` and `kVTDecompressionPropertyKey_RealTime`. Each reassembled frame is an Annex B access unit **split into all its NALUs**: SPS/PPS (re)build the format description on IDR frames; every frame's NALs are converted to length-prefixed AVCC (dropping the AUD) for the sample. **The single biggest bug of the project lived here** — the P-frame path treated a multi-NAL access unit (AUD + slice) as one NAL, producing a malformed sample VideoToolbox silently rejected, so *every* P-frame failed and only keyframes rendered (~1 fps, which presented as "the encoder is producing 170 Mbps"). See `PROTOCOL.md` receiver checklist step 7.
+- **Render (`VideoRenderer`):** a Metal `MTKView` + CoreVideo Metal texture cache; a fragment shader does BT.601 limited-range YCbCr→RGB. `present()` stores the latest frame's Y/CbCr textures; `draw()` renders on the next `setNeedsDisplay`. Frame timing is stamped in the command-buffer completion handler (true on-screen time).
+- **Diagnostics (`FrameTimings`):** a `FrameTrace` is threaded through reassembly → decode → render; `FrameTimingLog` prints per-60-frame min/avg/max for each stage plus rendered fps, packet-loss % (gaps in the continuous `SequenceNum`), decrypt failures, and decode submit/error counts. This instrumentation is what localized the P-frame bug (0% loss + 0.5 fps + all P-frame decode errors). Gate off with `FrameTimingLog.enabled = false`.
+
+---
+
+## Decisions Not Yet Made / Known limitations
+
+- **mDNS discovery:** Bonjour on Mac, `DnsServiceRegister` or a library on Windows. Currently the Mac needs the Windows LAN IP typed in manually, and it breaks whenever DHCP reassigns the PC's address. Highest-value next feature.
+- **Loss resilience:** there is no retransmission/FEC/NACK. On a clean LAN, loss is ~0% and this is fine; on a lossy link a single lost packet stalls decode until the next keyframe. The NVENC MFT ignores all GOP controls and emits ~1 keyframe/sec, so worst-case recovery is ~1 s and can't be shortened on hardware — a NACK that asks Windows to `RequestKeyFrame()` (over the existing Mac→Windows heartbeat channel) would be the clean fix.
+- **Once-per-second keyframe blip:** the periodic ~200-packet keyframe burst causes a small latency spike; unavoidable on NVENC (see above). Pacing the keyframe's packets on the sender could soften it.
+- **Configurable resolution / fps:** hardcoded to 1920×1080, and 60/30 fps by encoder path.
+- **Installer / distribution:** how the driver CLI gets bundled with the Windows app (currently copied from a source-tree `driver\` folder, git-ignored).
+- **ACCESS_LOST recovery:** `DxgiCapture` surfaces `DXGI_ERROR_ACCESS_LOST` (display mode change) via `CaptureFailed` → tray status, but does not yet recreate the duplication object and resume streaming automatically.
+- **Frame-buffer pooling:** the capture loop allocates a fresh ~8 MB BGRA buffer per emitted frame (two when the cursor is composited). Works, but is significant LOH churn at 60 fps; a rotation/pool scheme would need care around the channel's DropOldest semantics.

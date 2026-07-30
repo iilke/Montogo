@@ -2,7 +2,7 @@
 
 **Version:** 2  
 **Transport:** UDP unicast  
-**Discovery:** mDNS service type `_montogo._udp.local.`
+**Discovery:** manual — the user enters the Windows LAN IP in the Mac app. (mDNS via `_montogo._udp.local.` is planned but not implemented.)
 
 All multi-byte integer fields are **little-endian** (both platforms are LE: Windows/x86-64, Mac/ARM).
 
@@ -124,12 +124,17 @@ Every Montogo packet begins with these 4 bytes:
 | Value  | Name              | Direction      |
 |--------|-------------------|----------------|
 | `0x01` | VideoChunk        | Windows → Mac  |
-| `0x10` | Heartbeat         | Both           |
+| `0x10` | Heartbeat         | Mac → Windows  |
 | `0x11` | HandshakeRequest  | Mac → Windows  |
 | `0x12` | HandshakeResponse | Windows → Mac  |
 
 UDP is **one-directional for video**: Windows sends, Mac receives.  The Mac is a passive display;
-it sends only `HandshakeRequest` (and optionally `Heartbeat`) packets.  There are no input events.
+it sends only `HandshakeRequest` and `Heartbeat` packets.  There are no input events.
+
+**Liveness:** Windows does not send heartbeats.  The video stream itself is the liveness signal —
+the capture loop re-emits the last frame at the target fps even when the desktop is static, so a
+connected Mac always receives packets.  The Mac declares the connection lost after **3 seconds**
+without a valid-header packet and resumes handshaking.
 
 ---
 
@@ -137,7 +142,12 @@ it sends only `HandshakeRequest` (and optionally `Heartbeat`) packets.  There ar
 
 | Port      | Listener | Purpose                  |
 |-----------|----------|--------------------------|
-| **47921** | Windows  | Video stream + handshake |
+| **47921** | Both     | Video stream + handshake |
+
+Both sides bind 47921 and all traffic flows between the two bound sockets.  **Windows must send
+video from source port 47921** (the same socket that answered the handshake): macOS's stateful
+firewall only passes inbound UDP that looks like a reply to the Mac's outbound handshake, i.e.
+traffic from `WindowsIP:47921`.  Video sent from an ephemeral source port is dropped silently.
 
 ---
 
@@ -168,7 +178,9 @@ Carries one AES-256-GCM encrypted chunk of a single H.264-encoded frame.
 
 ## Heartbeat Packet — 16 bytes
 
-Sent every 1 second when no other traffic flows. Used for connection health monitoring.
+Sent by the Mac every 1 second while connected.  Windows currently ignores heartbeats (its send
+path needs no liveness signal from the Mac); they exist so a future Windows version can detect a
+departed Mac and return to the handshake loop.
 
 | Offset | Size | Type   | Field       | Description                           |
 |--------|------|--------|-------------|---------------------------------------|
@@ -183,8 +195,20 @@ Sent every 1 second when no other traffic flows. Used for connection health moni
 ## Handshake
 
 The Mac sends a `HandshakeRequest` on startup and retries every 500 ms until it receives a
-`HandshakeResponse`.  Windows accepts at most one successful handshake per app run — all subsequent
-`HandshakeRequest` packets are dropped silently once the pipeline is running.
+`HandshakeResponse`.
+
+Windows validates the token on **every** request:
+
+- **Invalid token** → dropped silently (an unauthenticated flood never touches the pipeline).
+  While no session is streaming, Windows also updates its local tray to `Wrong code from <ip>` so a
+  mistyped connection code is visible rather than a silent hang. Nothing is sent on the wire.
+- **Valid token, no session running** → Windows starts the pipeline and replies with a
+  `HandshakeResponse`. The first encoded frame is a keyframe, so the Mac can decode immediately.
+- **Valid token, session already running** (the Mac was relaunched with a new `ClientId`, or dropped
+  and is reconnecting) → Windows re-targets the running sender at the requester, replies with a
+  `HandshakeResponse` carrying the **existing** session `NoncePrefix`, and forces the encoder to emit
+  a keyframe on the next frame so the new client can start decoding at once. The pipeline is **not**
+  restarted, so the `EncKey`/`NoncePrefix` and the running `SequenceNum` counter are unchanged.
 
 ### HandshakeRequest (Mac → Windows) — 40 bytes
 
@@ -230,7 +254,10 @@ HMAC bytes verbatim into packet bytes 24–39.
 
 ---
 
-## Mac Implementation Checklist
+## Receiver Implementation Checklist
+
+Implemented by the Mac app in `mac/Montogo` (`UDPReceiver`, `ConnectionCode`, `AuthToken`,
+`StreamDecryptor`, `FrameAssembler`, `H264Decoder`); kept here as the spec-conformance checklist.
 
 1. **Setup (one-time):** user enters the 8-char code shown in the Windows tray; store it.
 2. **Key derivation:** decode code → 5-byte IKM → HKDF-SHA256 → `EncKey` + `AuthKey`.
@@ -244,6 +271,16 @@ HMAC bytes verbatim into packet bytes 24–39.
    d. Extract `ciphertext_len = PayloadLength - 16`.
    e. Decrypt: `plaintext = AES-256-GCM.Decrypt(EncKey, nonce, ciphertext=payload[0..ciphertext_len-1], tag=payload[ciphertext_len..])`.
    f. Drop chunk silently if GCM verification fails.
-   g. Buffer chunks by `FrameId`; once all `ChunkTotal` chunks are received, reassemble plaintext in `ChunkIndex` order and feed to H.264 decoder.
+   g. Buffer chunks by `FrameId`; once all `ChunkTotal` chunks are received, reassemble plaintext in `ChunkIndex` order and feed to the H.264 decoder.
    h. Drop incomplete frames after 100 ms timeout.
-7. **IDR recovery:** re-initialize the H.264 decoder on the first chunk of an IDR frame (`Flags & 1 == 1`).
+7. **Decode.** Each reassembled frame is an Annex B access unit that may contain **multiple NAL units**
+   (an IDR frame carries SPS + PPS + the IDR slice; a P-frame may carry an access-unit delimiter plus
+   the slice). Split on start codes and handle every NAL:
+   - On an IDR frame (`Flags & 1 == 1`): extract SPS (type 7) + PPS (type 8) and (re)build the decoder
+     format description from them when they change.
+   - For **all** frames, build the decoder sample by converting each NAL to length-prefixed AVCC
+     (`[4-byte big-endian length][NAL]`), dropping the AUD (type 9). Treating a multi-NAL P-frame as a
+     single NAL produces a malformed sample the decoder silently rejects — every P-frame fails and only
+     keyframes render.
+8. **Heartbeat:** send a `Heartbeat` packet every 1 s while connected.
+9. **Watchdog:** if no valid-header packet arrives for 3 s, declare the connection lost and return to the handshake loop (step 5).
