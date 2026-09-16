@@ -145,6 +145,8 @@ Everything derives from one short secret the user carries between the two apps.
 
 The whole scheme is a **pre-shared-key** design, not a key exchange. There is no forward secrecy and no protection against an attacker who already knows the code — both acceptable for "trusted people on my Wi-Fi." What it *does* buy: nobody without the code can authenticate, inject, or decrypt the stream.
 
+**At rest,** the code is never stored in plaintext: Windows encrypts it with DPAPI (`ProtectedData`, current-user scope) in `settings.json`; the Mac keeps it in the **Keychain** (the non-sensitive PC IP goes to `UserDefaults`). The code can be rotated from the Windows tray ("Reset connection code"), which regenerates the secret, tears down the live stream, and forces the Mac to re-pair. Rejected-token handshakes are logged (last 10) and viewable from the tray, so a wrong code or a probing device is visible rather than silent.
+
 ---
 
 ## 5. Networking design
@@ -153,6 +155,7 @@ The whole scheme is a **pre-shared-key** design, not a key exchange. There is no
 - **Discovery is manual.** The user reads the LAN IP off the tray and types it on the Mac. mDNS is the obvious next feature; until then a DHCP reservation keeps the IP stable.
 - **Handshake + liveness.** The Mac retries `HandshakeRequest` every 500 ms until it gets a response, then sends a `Heartbeat` every second. The video stream itself is the Mac's liveness signal (the static re-emit guarantees packets keep arriving); a 3 s watchdog with no valid packet declares the connection lost and restarts handshaking. Windows currently ignores heartbeats.
 - **Reconnect.** Windows validates the token on *every* request. A valid token while already streaming (a relaunched or reconnecting Mac) triggers a **re-handshake**: re-target the sender, resend the response with the existing nonce prefix, and force a keyframe — no pipeline restart. This replaced an earlier "drop all handshakes once running" rule that left relaunched Macs stuck forever.
+- **Auto-reconnect (Mac).** After a successful handshake the Mac saves the pairing (code → Keychain, IP → `UserDefaults`) and, on next launch, skips setup and connects immediately. If it doesn't connect within ~8 s it falls back to the setup screen with the values pre-filled; "Forget This Connection" clears the pairing.
 
 ---
 

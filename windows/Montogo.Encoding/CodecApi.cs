@@ -43,4 +43,8 @@ internal static class CodecApiGuids
 
     /// <summary>CODECAPI_AVEncVideoForceKeyFrame — VT_UI4, set to 1 to force the next frame to be a keyframe.</summary>
     public static readonly Guid AVEncVideoForceKeyFrame = new("398c1b98-8353-475a-9ef2-8f265d260345");
+
+    /// <summary>CODECAPI_AVEncMPVDefaultBPictureCount — VT_UI4, number of B-pictures between
+    /// I/P frames. 0 keeps the stream reorder-free (decode order = display order).</summary>
+    public static readonly Guid AVEncMPVDefaultBPictureCount = new("8d390aac-dc5c-4200-b57f-814d04babab2");
 }

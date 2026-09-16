@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Security.Cryptography;
 using System.Threading.Channels;
 using Montogo.Capture;
 using Montogo.Driver;
@@ -19,18 +20,30 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private const int VirtualWidth = 1920;
     private const int VirtualHeight = 1080;
 
-    // Hardware path: 60 fps @ 10 Mbps; software fallback: 30 fps @ 5 Mbps
+    // Hardware path: 60 fps @ 11 Mbps; software fallback: 30 fps @ 5 Mbps.
+    // Proven zero-loss point: the once-per-second keyframe (~340 KB, ~250 packets) fits
+    // under the link's burst buffer, so it sends cleanly with no packet pacing — pacing
+    // was tried at higher bitrates but its spin-wait stalled the encoder pump and
+    // corrupted the stream, so it was removed. Softer than 15-18 Mbps but stable.
     private const int HardwareFps     = 60;
-    private const int HardwareBitrate = 10_000_000;
+    private const int HardwareBitrate = 11_000_000;
     private const int SoftwareFps     = 30;
     private const int SoftwareBitrate =  5_000_000;
 
     private readonly NotifyIcon       _trayIcon;
     private readonly CancellationTokenSource _cts = new();
     private readonly AppSettings      _settings;
-    private readonly SecurityContext  _security;
+    private SecurityContext           _security;   // replaced by the tray "Reset connection code" action
     private ToolStripMenuItem _codeItem   = null!;
+    private ToolStripMenuItem _ipItem     = null!;
     private ToolStripMenuItem _statusItem = null!;
+    private IPAddress? _boundIp;   // LAN address the listener is bound to (what the Mac must enter)
+
+    // Rejected-handshake log: last 10 wrong-token attempts, shown via the tray.
+    // Written from the handshake loop (thread pool), read from the tray click (UI thread).
+    private readonly object      _securityLogLock = new();
+    private readonly List<string> _securityLog    = new();
+    private int _rejectedAttempts;
 
     private VirtualDisplayManager? _driver;
 
@@ -41,6 +54,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private UdpSender?   _sender;
     private Channel<(CapturedFrame Frame, long TimestampUs)>? _channel;
     private Task?        _pipelineTask;
+    private Channel<(EncodedFrame Frame, uint FrameId)>? _sendChannel;
+    private Task?        _sendTask;
+    private Task?        _keyframeTask;   // forces a periodic IDR so P-frame error can't accumulate
+
+    // Adaptive bitrate — AIMD congestion control driven by the Mac's loss feedback.
+    private int      _adaptiveMax;                    // ceiling = configured target bitrate
+    private int      _adaptiveBitrate;                // current adaptive target
+    private DateTime _lastAdapt = DateTime.MinValue;
+    private const int AdaptiveMinBitrate = 2_000_000; // don't starve below ~2 Mbps
 
     public TrayApplicationContext()
     {
@@ -63,10 +85,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private ContextMenuStrip BuildMenu()
     {
         _codeItem   = new ToolStripMenuItem($"Code: {_security.ConnectionCode}") { Enabled = false };
+        _ipItem     = new ToolStripMenuItem("PC address: (resolving…)") { Enabled = false };
         _statusItem = new ToolStripMenuItem("Starting…") { Enabled = false };
         var menu = new ContextMenuStrip();
         menu.Items.Add(_codeItem);
+        menu.Items.Add(_ipItem);
         menu.Items.Add(_statusItem);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Security log", null, (_, _) => ShowSecurityLog());
+        menu.Items.Add("Reset connection code", null, (_, _) => ResetConnectionCode());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => ExitApplication());
         return menu;
@@ -127,6 +154,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         DisplayInfo display, int targetFps, int targetBitrate, CancellationToken ct)
     {
         var (lanIp, warning) = LanIpResolver.GetLanAddress();
+        _boundIp = lanIp;
+        SetIpText(lanIp.ToString());
         UpdateStatus(warning is null
             ? $"Waiting for Mac… (LAN: {lanIp})"
             : $"Waiting for Mac… (warning: {warning})");
@@ -139,6 +168,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
             while (!ct.IsCancellationRequested)
             {
                 UdpReceiveResult result = await _listener.ReceiveAsync(ct);
+
+                // Link-quality feedback from the connected Mac steers the encoder bitrate.
+                if (IsFeedback(result.Buffer)) { HandleFeedback(result.Buffer, result.RemoteEndPoint); continue; }
+
                 if (!IsHandshakeRequest(result.Buffer)) continue;
 
                 var req = MemoryMarshal.Read<HandshakeRequestPacket>(result.Buffer);
@@ -149,6 +182,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 // while allowing a relaunched Mac to reconnect below.
                 if (!_security.ValidateToken(req.ClientId, req.Token))
                 {
+                    RecordRejectedAttempt(result.RemoteEndPoint.Address);
                     // Surface the rejection locally (not to the network) so a wrong
                     // connection code is visible instead of a silent "stuck connecting".
                     // Only while not yet streaming, so it can't disturb a live session.
@@ -204,6 +238,50 @@ internal sealed class TrayApplicationContext : ApplicationContext
         return buf[3] == (byte)PacketType.HandshakeRequest;
     }
 
+    private static bool IsFeedback(byte[] buf)
+    {
+        if (buf.Length < Unsafe.SizeOf<FeedbackPacket>()) return false;
+        if (BinaryPrimitives.ReadUInt16LittleEndian(buf) != ProtocolConstants.Magic) return false;
+        if (buf[2] != ProtocolConstants.CurrentVersion) return false;
+        return buf[3] == (byte)PacketType.Feedback;
+    }
+
+    // AIMD adaptive bitrate: cut fast when the Mac reports loss, probe back up slowly when
+    // the link is clean. This is the congestion control that lets the stream ride out a
+    // link that can't hold a fixed rate — the encoder is told to send only what fits.
+    private void HandleFeedback(byte[] buf, IPEndPoint source)
+    {
+        if (_encoder is null || _sender?.Target is null || _adaptiveMax <= 0) return;
+
+        var fb = MemoryMarshal.Read<FeedbackPacket>(buf);
+        if (!_security.ValidateToken(fb.ClientId, fb.Token)) return;      // only the paired Mac may steer
+        if (!source.Address.Equals(_sender.Target.Address)) return;
+
+        double loss = fb.LossPermille / 1000.0;
+
+        // Adaptive FEC: raise redundancy as loss climbs (responds every feedback, cheap).
+        // More parity costs bandwidth, but the bitrate back-off below frees room for it.
+        int fecPct = loss > 0.20 ? 70 : loss > 0.08 ? 50 : loss > 0.02 ? 35 : 20;
+        _sender.SetFecPercent(fecPct);
+
+        // React on bitrate at the feedback cadence, not faster.
+        DateTime now = DateTime.UtcNow;
+        if ((now - _lastAdapt).TotalMilliseconds < 350) return;
+        _lastAdapt = now;
+        int cur  = _adaptiveBitrate > 0 ? _adaptiveBitrate : _adaptiveMax;
+        int next = cur;
+        if      (loss > 0.10)  next = (int)(cur * 0.6);   // heavy loss: back off hard
+        else if (loss > 0.03)  next = (int)(cur * 0.85);  // some loss: ease down
+        else if (loss < 0.015) next = cur + 1_000_000;    // clean: probe up (+1 Mbps)
+
+        next = Math.Clamp(next, AdaptiveMinBitrate, _adaptiveMax);
+        if (next == cur) return;
+
+        _adaptiveBitrate = next;
+        _encoder.SetBitrate(next);
+        UpdateStatus($"Adapting: {loss * 100:F0}% loss → {next / 1_000_000.0:F1} Mbps");
+    }
+
     private static async Task SendHandshakeResponseAsync(
         UdpClient listener, IPEndPoint macEndpoint,
         DisplayInfo display, Guid clientId, int targetFps, ulong noncePrefix, CancellationToken ct)
@@ -235,17 +313,29 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _encoder = new H264Encoder(
             new EncoderOptions(display.Width, display.Height, targetFps, targetBitrate));
 
-        // Wire encoder output → UDP sender.
-        // FrameEncoded fires synchronously from SubmitFrame on the pipeline task thread.
+        // Adaptive bitrate starts at the configured target and only moves down from there
+        // under loss (probing back up toward this ceiling when the link is clean).
+        _adaptiveMax     = targetBitrate;
+        _adaptiveBitrate = targetBitrate;
+
+        // Wire encoder output → a send queue drained by a dedicated send loop.
+        // FrameEncoded fires synchronously on the encoder's pump thread (inside
+        // SubmitFrame). Doing the UDP send there blocked that thread, so any send-side
+        // work — pacing, and soon FEC/retransmission — stalled the encoder itself and
+        // corrupted the stream. Enqueuing is non-blocking, so the pump is never held up;
+        // the send loop owns all network timing. Bounded + DropOldest caps memory if the
+        // network stalls badly (a dropped encoded frame resets at the next keyframe); in
+        // normal operation the send loop keeps up and the queue stays near-empty.
+        _sendChannel = Channel.CreateBounded<(EncodedFrame, uint)>(
+            new BoundedChannelOptions(16)
+            {
+                FullMode     = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = true,
+            });
         uint frameId = 0;
-        _encoder.FrameEncoded += encoded =>
-            _sender!.SendFrameAsync(
-                encoded.Data,
-                frameId++,
-                (ulong)encoded.TimestampUs,
-                encoded.IsKeyFrame,
-                _cts.Token
-            ).GetAwaiter().GetResult();
+        _encoder.FrameEncoded += encoded => _sendChannel!.Writer.TryWrite((encoded, frameId++));
+        _sendTask = Task.Run(SendLoopAsync);
 
         _encoder.Initialize();
 
@@ -270,6 +360,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
         // Pipeline task: drain channel → encode (→ FrameEncoded → send).
         _pipelineTask = Task.Run(PipelineLoopAsync);
 
+        // Force an IDR every second. Telemetry showed NVENC emitting no periodic keyframes
+        // on this config (IDR=0 per window), so P-frame prediction/quantization error had
+        // nothing to reset it and accumulated over time. A once-a-second forced keyframe
+        // bounds that — the standard low-latency approach when there's no intra-refresh.
+        _keyframeTask = Task.Run(async () =>
+        {
+            try
+            {
+                while (!_cts.IsCancellationRequested)
+                {
+                    await Task.Delay(1000, _cts.Token);
+                    _encoder?.RequestKeyFrame();
+                }
+            }
+            catch (OperationCanceledException) { }
+        });
+
         _capture.Start();
     }
 
@@ -287,20 +394,127 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    // Drains encoded frames and ships them over UDP — off the encoder's pump thread, so
+    // the send path can take its time (pacing / FEC / retransmission) without stalling
+    // the encoder. Owns all network-side timing for the video stream.
+    private async Task SendLoopAsync()
+    {
+        try
+        {
+            await foreach (var (frame, id) in _sendChannel!.Reader.ReadAllAsync(_cts.Token))
+                await _sender!.SendFrameAsync(
+                    frame.Data, id, (ulong)frame.TimestampUs, frame.IsKeyFrame, _cts.Token);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            UpdateStatus($"Send error: {ex.Message}");
+        }
+    }
+
     // ── Shutdown ─────────────────────────────────────────────────────────────
 
     private void ExitApplication()
     {
         _trayIcon.Visible = false;
-        _cts.Cancel();
-        _capture?.Stop();                              // joins capture thread
-        _channel?.Writer.TryComplete();               // signals pipeline task to finish
-        _pipelineTask?.Wait(TimeSpan.FromSeconds(2)); // wait for encode+send to drain
-        _encoder?.Dispose();                          // sends NOTIFY_END_STREAMING + MFShutdown
-        _sender?.Dispose();                            // does NOT close _listener (not owned)
-        _listener?.Dispose();                          // close after sender is done
-        try { _driver?.RemoveAllAsync().GetAwaiter().GetResult(); } catch { }
+
+        // Tear down on a thread-pool thread, NOT here on the WinForms UI thread.
+        // RemoveAllAsync ultimately awaits the driver CLI's Process I/O; blocking on it
+        // with GetResult() while on the UI thread deadlocks — those awaited continuations
+        // try to resume on this thread's captured SynchronizationContext, but the thread
+        // is blocked in GetResult(). That deadlock is what left the process hung
+        // (Application.Exit was never reached) and the virtual display un-removed.
+        // Off the UI thread there is no captured context, so the awaits resume on the
+        // pool and RemoveAllAsync runs to completion before we exit.
+        Task.Run(() =>
+        {
+            _cts.Cancel();
+            _capture?.Stop();                              // joins the capture thread
+            _channel?.Writer.TryComplete();               // signals the pipeline task to finish
+            _sendChannel?.Writer.TryComplete();           // signals the send loop to finish
+            _pipelineTask?.Wait(TimeSpan.FromSeconds(2)); // let encode drain
+            _sendTask?.Wait(TimeSpan.FromSeconds(2));     // let the send loop drain
+            _keyframeTask?.Wait(TimeSpan.FromSeconds(1)); // stop the keyframe timer
+            _encoder?.Dispose();                          // NOTIFY_END_STREAMING + MFShutdown
+            _sender?.Dispose();                           // does NOT close _listener (not owned)
+            _listener?.Dispose();                         // close after the sender is done
+            try { _driver?.RemoveAllAsync().GetAwaiter().GetResult(); } // remove the virtual display
+            catch { }
+        }).Wait(TimeSpan.FromSeconds(5));                 // bounded so a stuck teardown can't hang exit
+
         Application.Exit();
+    }
+
+    // ── Security log & connection-code reset ─────────────────────────────────
+
+    private void RecordRejectedAttempt(IPAddress source)
+    {
+        lock (_securityLogLock)
+        {
+            _rejectedAttempts++;
+            _securityLog.Add($"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {source}  (attempt #{_rejectedAttempts})");
+            if (_securityLog.Count > 10) _securityLog.RemoveAt(0);
+        }
+    }
+
+    private void ShowSecurityLog()
+    {
+        string body;
+        lock (_securityLogLock)
+        {
+            body = _securityLog.Count == 0
+                ? "No rejected connection attempts recorded."
+                : string.Join(Environment.NewLine, _securityLog);
+        }
+        MessageBox.Show(body, "Montogo — Security log (last 10 rejected attempts)",
+            MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private void ResetConnectionCode()
+    {
+        if (MessageBox.Show(
+                "This will disconnect the Mac app and require re-entering the code. Continue?",
+                "Reset connection code", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
+            != DialogResult.Yes) return;
+
+        // New secret → DPAPI-encrypt + persist, then swap the live security context so
+        // the handshake loop immediately validates against the new code and any new
+        // pipeline uses the new cipher.
+        string newCode = SecurityContext.EncodeConnectionCode(RandomNumberGenerator.GetBytes(5));
+        _settings.SetConnectionCode(newCode);
+        SecurityContext oldSecurity = _security;
+        _security = new SecurityContext(newCode);
+        _codeItem.Text = $"Code: {_security.ConnectionCode}";
+        UpdateStatus(_boundIp is null
+            ? "Connection code reset — waiting for Mac…"
+            : $"Connection code reset — waiting for Mac at {_boundIp}…");
+
+        // Tear the running session down off the UI thread (blocking on the pipeline
+        // drain here would freeze the tray). Dropping the stream makes the Mac's
+        // watchdog fire; its next handshake carries the old code and is rejected, so it
+        // falls back to its setup screen and must re-enter the new code.
+        Task.Run(() =>
+        {
+            TearDownPipeline();
+            oldSecurity.Dispose();
+        });
+    }
+
+    /// <summary>Stops and clears the capture→encode→send pipeline without touching the
+    /// UDP listener or the handshake loop, so a fresh session can start on the next
+    /// authenticated handshake. Does not cancel <c>_cts</c>.</summary>
+    private void TearDownPipeline()
+    {
+        _capture?.Stop();                              // joins the capture thread
+        _channel?.Writer.TryComplete();               // ends the pipeline task's read loop
+        _pipelineTask?.Wait(TimeSpan.FromSeconds(2)); // let encode + send drain
+        _encoder?.Dispose();
+        _sender?.Dispose();                            // does not close _listener (not owned)
+        _capture      = null;
+        _encoder      = null;
+        _sender       = null;
+        _channel      = null;
+        _pipelineTask = null;
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -314,6 +528,16 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _statusItem.Text = text;
             _trayIcon.Text   = $"Montogo – {text[..Math.Min(text.Length, 60)]}"; // NotifyIcon.Text max 63 chars
         }
+    }
+
+    // Always-visible "PC address" line so the IP to enter on the Mac is in the tray menu
+    // (independent of the status line, which other events overwrite).
+    private void SetIpText(string ip)
+    {
+        if (_trayIcon.ContextMenuStrip is { } menu && menu.InvokeRequired)
+            menu.BeginInvoke(() => SetIpText(ip));
+        else
+            _ipItem.Text = $"PC address: {ip}";
     }
 
     protected override void Dispose(bool disposing)

@@ -160,7 +160,16 @@ public sealed class DxgiCapture : IDisposable
             // frameData is the reusable GPU-to-CPU staging buffer; it must not be passed
             // to the pipeline directly because the capture thread overwrites it each frame.
             var frameData = new byte[width * height * 4];
-            int timeoutMs = 1000 / Math.Max(1, _options.TargetFps);
+
+            // Steady-cadence pacing on a high-resolution clock. Poll DXGI several times
+            // per frame interval and emit on a precise deadline. (The old path used a
+            // ~16 ms AcquireNextFrame timeout gated by Environment.TickCount64, whose
+            // ~16 ms resolution made the re-emit repeatedly just-miss and jitter to
+            // ~30-40 fps on a static desktop.)
+            var    pacer           = System.Diagnostics.Stopwatch.StartNew();
+            double frameIntervalMs = 1000.0 / Math.Max(1, _options.TargetFps);
+            int    pollMs          = Math.Max(1, (int)(frameIntervalMs / 3));
+            double nextEmitMs      = frameIntervalMs;
 
             // DXGI only delivers frames when desktop content changes.  On a static
             // desktop AcquireNextFrame times out forever, which would starve the
@@ -170,7 +179,6 @@ public sealed class DxgiCapture : IDisposable
             // composited per emit so it can move over a static desktop.
             byte[]? lastFrame   = null;
             byte[]? lastEmitted = null;
-            long    lastEmitMs  = 0;
 
             // Cursor state, updated from DXGI pointer info on each acquired frame.
             var  cursorShape     = Array.Empty<byte>();
@@ -199,7 +207,7 @@ public sealed class DxgiCapture : IDisposable
                 {
                     try
                     {
-                        duplication.AcquireNextFrame((uint)timeoutMs, out frameInfo, out resource);
+                        duplication.AcquireNextFrame((uint)pollMs, out frameInfo, out resource);
                         hasFrame = true;
                     }
                     catch (COMException ex) when (ex.HResult == E_DXGI_WAIT_TIMEOUT)
@@ -259,16 +267,18 @@ public sealed class DxgiCapture : IDisposable
                     // Emitted buffers are never mutated after creation, so re-emitting
                     // one is safe under the receiver-owns-the-buffer contract; only a
                     // cursor change forces a fresh composite.
-                    long nowMs = Environment.TickCount64;
-                    if (lastFrame is not null && nowMs - lastEmitMs >= timeoutMs)
+                    double nowMs = pacer.Elapsed.TotalMilliseconds;
+                    if (lastFrame is not null && nowMs >= nextEmitMs)
                     {
-                        lastEmitMs = nowMs;
                         if (cursorDirty || lastEmitted is null)
                         {
                             lastEmitted = ComposeEmit();
                             cursorDirty = false;
                         }
                         FrameCaptured?.Invoke(new CapturedFrame { BgraData = lastEmitted, Width = width, Height = height });
+                        nextEmitMs += frameIntervalMs;
+                        // If we fell well behind (a long stall), resync rather than bursting.
+                        if (nowMs - nextEmitMs > frameIntervalMs * 4) nextEmitMs = nowMs + frameIntervalMs;
                     }
                     continue;
                 }
@@ -306,8 +316,9 @@ public sealed class DxgiCapture : IDisposable
                 lastFrame   = frameCopy;
                 lastEmitted = ComposeEmit();
                 cursorDirty = false;
-                lastEmitMs  = Environment.TickCount64;
                 FrameCaptured?.Invoke(new CapturedFrame { BgraData = lastEmitted, Width = width, Height = height });
+                // A real frame just went out — schedule the next idle re-emit one interval on.
+                nextEmitMs = pacer.Elapsed.TotalMilliseconds + frameIntervalMs;
             }
         }
         finally

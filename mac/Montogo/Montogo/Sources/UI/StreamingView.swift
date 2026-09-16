@@ -16,7 +16,66 @@ struct StreamingView: View {
             if isDisconnected {
                 DisconnectedOverlay()
             }
+
+            // Live link monitor, top-right. Click-through so it never blocks the
+            // disconnected overlay's buttons.
+            VStack {
+                HStack {
+                    Spacer()
+                    LinkMonitorView(stats: vm.linkStats)
+                }
+                Spacer()
+            }
+            .padding(14)
+            .allowsHitTesting(false)
         }
+    }
+}
+
+// MARK: - Link monitor (top-right HUD)
+
+private struct LinkMonitorView: View {
+    let stats: LinkStats?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(healthColor)
+                .frame(width: 8, height: 8)
+                .shadow(color: healthColor.opacity(0.8), radius: 3)
+
+            if let s = stats {
+                metric("\(Int(s.fps.rounded()))", "fps")
+                metric("\(Int(s.latencyAvgMs.rounded()))", "ms")
+                metric(String(format: "%.1f%%", s.lossPct), "loss")
+            } else {
+                Text("link idle").foregroundStyle(.white.opacity(0.6))
+            }
+        }
+        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.black.opacity(0.5), in: Capsule())
+        .overlay(Capsule().strokeBorder(.white.opacity(0.12)))
+    }
+
+    private func metric(_ value: String, _ unit: String) -> some View {
+        HStack(spacing: 3) {
+            Text(value)
+            Text(unit)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.55))
+        }
+    }
+
+    // Green = healthy; yellow = minor loss / latency spike / fps dip;
+    // red = real packet loss or decode errors (the usual causes of on-screen shredding).
+    private var healthColor: Color {
+        guard let s = stats else { return .gray }
+        if s.lossPct > 1 || s.decodeErrors > 0 { return .red }
+        if s.lossPct > 0 || s.latencyMaxMs > 60 || s.fps < 40 { return .yellow }
+        return .green
     }
 }
 
@@ -68,6 +127,10 @@ private struct DisconnectedOverlay: View {
                     .tint(.white)
                     .foregroundStyle(.white)
                     .padding(.top, 12)
+
+                Button("Forget This Connection") { vm.forget() }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.white.opacity(0.55))
             }
         }
     }

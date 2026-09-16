@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -58,6 +59,62 @@ public sealed class UdpSender : IDisposable
 
     public void SetTarget(IPEndPoint endpoint) => _target = endpoint;
 
+    // --- Forward error correction (Reed–Solomon over GF(256)) ------------------
+    // Every frame ships with m parity packets so the Mac can rebuild chunks the Wi-Fi
+    // drops, with no retransmission round-trip. The code is systematic: data chunks go out
+    // unchanged, and parity row j is a Cauchy GF(256) linear combination of ALL data
+    // chunks, computed over a fixed-width unit [2-byte LE length][plaintext][zero pad] so a
+    // rebuilt chunk knows its own length. Because it is MDS, ANY k of the (k + m) chunks
+    // recover the original k — so a frame survives up to m losses no matter where they land
+    // (a keyframe included), which interleaved XOR could not do at high loss.
+    //
+    // Overhead is ADAPTIVE: the controller raises _fecPercent as the Mac reports more loss
+    // (SetFecPercent), and IDR frames get an extra margin since losing a keyframe costs
+    // ~1 s of corruption. FecMaxParity caps the cost; k + m ≤ 255 is a hard GF(256) limit.
+    private volatile int _fecPercent = 25;      // adaptive; set from the feedback controller
+    private const int    FecMaxParity = 48;
+    private const int    FecIdrBonus  = 30;      // unequal error protection: harden keyframes
+    private static readonly int FecUnitSize = ProtocolConstants.MaxChunkPayload + 2;
+
+    /// <summary>Set the FEC overhead (percent of data chunks) — the adaptive controller
+    /// raises this under loss and lowers it when the link is clean.</summary>
+    public void SetFecPercent(int percent) => _fecPercent = Math.Clamp(percent, 10, 100);
+
+    private int FecParityCount(int chunkCount, bool isIdr)
+    {
+        if (chunkCount <= 0) return 0;
+        int pct = _fecPercent + (isIdr ? FecIdrBonus : 0);
+        int r = (chunkCount * pct + 99) / 100; // ceil
+        if (r < 1) r = 1;
+        if (r > FecMaxParity) r = FecMaxParity;
+        if (r > chunkCount)   r = chunkCount;
+        if (r > 255 - chunkCount) r = Math.Max(0, 255 - chunkCount); // RS: k + m ≤ 255
+        return r;
+    }
+
+    // --- Send pacing -----------------------------------------------------------
+    // A large frame (keyframe + its parity ≈ hundreds of packets) handed to the socket at
+    // once bursts past the Wi-Fi buffer — the dominant loss source, and FEC made the burst
+    // bigger. Spreading such a frame's packets at a steady byte rate keeps the buffer
+    // shallow so it stops overflowing; FEC then covers the residual random loss.
+    //
+    // This runs on the dedicated send loop (TrayApplicationContext.SendLoopAsync), NOT the
+    // encoder pump — so unlike the earlier attempt it cannot stall the encoder. Frames that
+    // pile up during a paced burst simply wait in the send channel and drain right after,
+    // so there are no dropped frames and no broken references. Small frames send at once
+    // (no added latency). Sub-ms gaps need a spin wait (Windows timer resolution is ~15 ms).
+    private const long PacingBytesPerSecond = 10_000_000; // ~80 Mbps
+    private const int  PacingChunkThreshold = 96;         // only frames larger than this are paced
+    private static readonly double PacingTicksPerByte =
+        (double)Stopwatch.Frequency / PacingBytesPerSecond;
+
+    private static void PaceGate(Stopwatch? pacer, long pacedBytes)
+    {
+        if (pacer is null) return;
+        long dueTicks = (long)(pacedBytes * PacingTicksPerByte);
+        while (pacer.ElapsedTicks < dueTicks) Thread.SpinWait(8);
+    }
+
     public async ValueTask SendFrameAsync(
         ReadOnlyMemory<byte> encodedFrame,
         uint   frameId,
@@ -70,12 +127,21 @@ public sealed class UdpSender : IDisposable
         int totalLen = encodedFrame.Length;
         if (totalLen == 0) return;
 
-        int chunkCount = (totalLen + ProtocolConstants.MaxChunkPayload - 1) / ProtocolConstants.MaxChunkPayload;
-        byte flags = isIdr ? (byte)1 : (byte)0;
+        int  chunkCount = (totalLen + ProtocolConstants.MaxChunkPayload - 1) / ProtocolConstants.MaxChunkPayload;
+        int  fecCount   = FecParityCount(chunkCount, isIdr);
+        byte flags      = isIdr ? (byte)1 : (byte)0;
 
-        // One rented buffer covers the header + max ciphertext + GCM tag for any chunk.
-        int bufSize = HeaderSize + ProtocolConstants.MaxChunkPayload + ProtocolConstants.GcmTagSize;
+        // Pace only large frames (keyframe + parity); small frames burst fine.
+        Stopwatch? pacer      = (chunkCount + fecCount) > PacingChunkThreshold ? Stopwatch.StartNew() : null;
+        long       pacedBytes = 0;
+
+        // One rented buffer covers the header + the largest payload (a parity unit) + tag.
+        int bufSize = HeaderSize + FecUnitSize + ProtocolConstants.GcmTagSize;
         byte[] buf  = ArrayPool<byte>.Shared.Rent(bufSize);
+
+        // Parity accumulators: fecCount stripes × FecUnitSize plaintext bytes, XORed as we go.
+        byte[]? parity = fecCount > 0 ? ArrayPool<byte>.Shared.Rent(fecCount * FecUnitSize) : null;
+        if (parity is not null) Array.Clear(parity, 0, fecCount * FecUnitSize);
 
         // Nonce layout: [0..7] = session prefix (set once here), [8..11] = SequenceNum (per-chunk).
         byte[] nonce = new byte[ProtocolConstants.GcmNonceSize];
@@ -100,37 +166,104 @@ public sealed class UdpSender : IDisposable
                     ChunkTotal    = (ushort)chunkCount,
                     PayloadLength = (ushort)(chunkLen + ProtocolConstants.GcmTagSize),
                     Flags         = flags,
+                    FecTotal      = (byte)fecCount,
                 };
 
-                // Span usage lives in a synchronous helper (C# 12 restriction on async methods).
-                int sendLen = BuildAndEncrypt(buf, nonce, in header, encodedFrame, offset, chunkLen);
+                // Span usage + parity XOR live in a synchronous helper (C# 12 forbids
+                // Span locals across await in this async method).
+                int sendLen = BuildDataChunk(buf, nonce, in header, encodedFrame, offset, chunkLen,
+                                             parity, fecCount, i);
 
+                PaceGate(pacer, pacedBytes);
                 await _client.SendAsync(buf.AsMemory(0, sendLen), _target, ct);
+                pacedBytes += sendLen;
+            }
+
+            // Parity packets follow the data. ChunkIndex = chunkCount + g marks stripe g.
+            for (int g = 0; g < fecCount; g++)
+            {
+                var header = new VideoChunkHeader
+                {
+                    Magic         = ProtocolConstants.Magic,
+                    Version       = ProtocolConstants.CurrentVersion,
+                    PacketType    = (byte)PacketType.VideoChunk,
+                    SequenceNum   = _sequenceNum++,
+                    FrameId       = frameId,
+                    TimestampUs   = timestampUs,
+                    ChunkIndex    = (ushort)(chunkCount + g),
+                    ChunkTotal    = (ushort)chunkCount,
+                    PayloadLength = (ushort)(FecUnitSize + ProtocolConstants.GcmTagSize),
+                    Flags         = flags,
+                    FecTotal      = (byte)fecCount,
+                };
+
+                int sendLen = BuildParityChunk(buf, nonce, in header, parity!, g * FecUnitSize);
+
+                PaceGate(pacer, pacedBytes);
+                await _client.SendAsync(buf.AsMemory(0, sendLen), _target, ct);
+                pacedBytes += sendLen;
             }
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(buf);
+            if (parity is not null) ArrayPool<byte>.Shared.Return(parity);
         }
     }
 
-    // Synchronous: updates nonce[8..11], writes header, encrypts chunk into buf.
-    private int BuildAndEncrypt(
+    // Synchronous: writes+encrypts a data chunk into buf, and folds its length-prefixed
+    // padded unit into parity stripe (chunkIndex % fecCount). Returns the packet length.
+    private int BuildDataChunk(
         byte[] buf, byte[] nonce, in VideoChunkHeader header,
-        ReadOnlyMemory<byte> frame, int offset, int chunkLen)
+        ReadOnlyMemory<byte> frame, int offset, int chunkLen,
+        byte[]? parity, int fecCount, int chunkIndex)
     {
-        // nonce[0..7] = prefix already set; only the SequenceNum part changes per chunk.
         BinaryPrimitives.WriteUInt32LittleEndian(nonce.AsSpan(8), header.SequenceNum);
+        MemoryMarshal.Write(buf, in header);
 
+        ReadOnlySpan<byte> plaintext = frame.Span.Slice(offset, chunkLen);
+        _cipher.Encrypt(
+            nonce,
+            plaintext,
+            buf.AsSpan(HeaderSize, chunkLen),
+            buf.AsSpan(HeaderSize + chunkLen, ProtocolConstants.GcmTagSize));
+
+        if (parity is not null)
+        {
+            // Fold this data chunk's length-prefixed unit into every parity row, each scaled
+            // by its Cauchy coefficient (RS systematic encode). Padding bytes are 0 and
+            // contribute nothing, so only the length prefix + payload are folded.
+            byte lenLo = (byte)(chunkLen & 0xFF);
+            byte lenHi = (byte)((chunkLen >> 8) & 0xFF);
+            for (int j = 0; j < fecCount; j++)
+            {
+                byte c = ReedSolomon.Coeff(j, chunkIndex, fecCount);
+                if (c == 0) continue;
+                int p = j * FecUnitSize;
+                parity[p]     ^= ReedSolomon.Mul(c, lenLo);
+                parity[p + 1] ^= ReedSolomon.Mul(c, lenHi);
+                Span<byte> row = parity.AsSpan(p + 2, chunkLen);
+                for (int b = 0; b < chunkLen; b++) row[b] ^= ReedSolomon.Mul(c, plaintext[b]);
+            }
+        }
+
+        return HeaderSize + chunkLen + ProtocolConstants.GcmTagSize;
+    }
+
+    // Synchronous: writes+encrypts one full parity stripe (FecUnitSize plaintext) into buf.
+    private int BuildParityChunk(
+        byte[] buf, byte[] nonce, in VideoChunkHeader header, byte[] parity, int stripeOffset)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(nonce.AsSpan(8), header.SequenceNum);
         MemoryMarshal.Write(buf, in header);
 
         _cipher.Encrypt(
             nonce,
-            frame.Slice(offset, chunkLen).Span,
-            buf.AsSpan(HeaderSize, chunkLen),
-            buf.AsSpan(HeaderSize + chunkLen, ProtocolConstants.GcmTagSize));
+            parity.AsSpan(stripeOffset, FecUnitSize),
+            buf.AsSpan(HeaderSize, FecUnitSize),
+            buf.AsSpan(HeaderSize + FecUnitSize, ProtocolConstants.GcmTagSize));
 
-        return HeaderSize + chunkLen + ProtocolConstants.GcmTagSize;
+        return HeaderSize + FecUnitSize + ProtocolConstants.GcmTagSize;
     }
 
     public void Dispose() { if (_ownsClient) _client.Dispose(); }

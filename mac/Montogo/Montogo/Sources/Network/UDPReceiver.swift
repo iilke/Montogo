@@ -29,6 +29,12 @@ actor UDPReceiver {
     private var handshakeTimer: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
+    private var feedbackTask: Task<Void, Never>?
+
+    // Rolling packet-loss accounting for the feedback report, reset each interval.
+    private var fbSeqMin: UInt32?
+    private var fbSeqMax: UInt32 = 0
+    private var fbCount: Int = 0
 
     var onStateChange: ((ConnectionState) -> Void)?
     var onFrame: ((UInt32, Data, Bool, FrameTrace) -> Void)?
@@ -61,6 +67,7 @@ actor UDPReceiver {
         handshakeTimer?.cancel()
         heartbeatTask?.cancel()
         watchdogTask?.cancel()
+        feedbackTask?.cancel()
         readSource?.cancel()
         readSource = nil
         datagramFeed?.finish()
@@ -179,6 +186,7 @@ actor UDPReceiver {
         onStateChange?(.connected(fps: resp.targetFps, width: resp.displayWidth, height: resp.displayHeight))
         startHeartbeat()
         startWatchdog()
+        startFeedback()
     }
 
     // MARK: - Receive
@@ -208,6 +216,13 @@ actor UDPReceiver {
         let plaintext = decryptor.decrypt(payload: payload, sequenceNum: header.sequenceNum)
         // Count every arriving chunk by its continuous SequenceNum so gaps = packet loss.
         FrameTimingLog.shared.recordChunk(seq: header.sequenceNum, decrypted: plaintext != nil)
+        // Same accounting over the shorter feedback window that drives adaptive bitrate.
+        if fbSeqMin == nil { fbSeqMin = header.sequenceNum; fbSeqMax = header.sequenceNum }
+        else {
+            if header.sequenceNum < fbSeqMin! { fbSeqMin = header.sequenceNum }
+            if header.sequenceNum > fbSeqMax { fbSeqMax = header.sequenceNum }
+        }
+        fbCount += 1
         guard let plaintext else { return }
         if let (frameId, nalData, isIDR, trace) = assembler.add(header: header, plaintext: plaintext,
                                                                 recvTime: recvTime) {
@@ -229,6 +244,31 @@ actor UDPReceiver {
         }
     }
 
+    // MARK: - Feedback (adaptive bitrate)
+
+    // Reports packet loss over the last window to Windows a few times a second, so the
+    // encoder can drop its bitrate to match the link (and probe back up when it clears).
+    private func startFeedback() {
+        feedbackTask?.cancel()
+        feedbackTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 400_000_000)   // 400 ms
+                var permille: UInt16 = 0
+                if let mn = fbSeqMin, fbSeqMax >= mn {
+                    let expected = Int(fbSeqMax - mn) + 1
+                    if expected > 0 {
+                        let lost = max(0, expected - fbCount)
+                        permille = UInt16(min(1000, lost * 1000 / expected))
+                    }
+                }
+                fbSeqMin = nil; fbSeqMax = 0; fbCount = 0
+                let pkt = FeedbackPacket.build(clientId: clientId, authToken: authToken,
+                                               lossPermille: permille, fps: 0)
+                send(pkt)
+            }
+        }
+    }
+
     // MARK: - Watchdog
 
     private func startWatchdog() {
@@ -238,6 +278,7 @@ actor UDPReceiver {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Date().timeIntervalSince(lastPacketTime) > MontogoProtocol.connectionLostTimeout {
                     heartbeatTask?.cancel()
+                    feedbackTask?.cancel()
                     onStateChange?(.lost)
                     beginHandshaking()
                     return

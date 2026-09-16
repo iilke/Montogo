@@ -47,18 +47,20 @@ The link is one-directional — Windows sends pixels, the Mac displays them. Key
 3. The stream starts automatically once the handshake completes. Press **⌃⌘F** for full screen.
 4. Extend your Windows desktop onto the new virtual display (Windows **Display settings** → the second monitor) and drag windows onto it — they appear on the Mac.
 
-If the Mac hangs on "Connecting…", the Windows tray tells you why: `Wrong code from …` means the code doesn't match; no reaction at all usually means the IP is wrong or the two devices can't reach each other on the network.
+The Mac **remembers the pairing** (code in the Keychain, IP in preferences) and auto-reconnects on later launches, skipping the setup screen. If the saved PC can't be reached within ~8 seconds it drops back to setup with the values pre-filled. Use **Connection ▸ Forget This Connection** (or the on-screen button) to clear it.
+
+If the Mac hangs on "Connecting…", the Windows tray tells you why: `Wrong code from …` means the code doesn't match; no reaction at all usually means the IP is wrong or the two devices can't reach each other on the network. The tray also has a **Security log** (recent rejected attempts) and **Reset connection code** (rotate the secret — this disconnects the Mac and requires re-entering the new code).
 
 ## Known limitations
 
-- **Manual IP entry.** There is no service discovery yet, so you type the PC's LAN IP. It changes when DHCP reassigns it — use a DHCP reservation to keep it stable.
+- **Manual IP entry.** There is no service discovery yet, so you type the PC's LAN IP once (the Mac then remembers it). It changes when DHCP reassigns it — use a DHCP reservation to keep it stable, or just re-enter it on the pre-filled setup screen when auto-reconnect falls back.
 - **Fixed resolution.** The virtual display is 1920×1080. Not yet configurable.
 - **One Mac at a time**, and one Windows instance at a time.
 - **No audio.** Sound stays on the Windows machine.
 - **Reconnect after network loss** can take a moment; the encoder issues a fresh keyframe when a client (re)connects.
 - **No packet retransmission.** On a clean LAN this is fine (≈0% loss). On a lossy link, a dropped packet freezes the picture until the next keyframe (~1 s).
 - **Display-mode changes** on the captured output currently stop the stream (surfaced in the tray); restart to recover.
-- **Security is LAN-scoped.** The 8-character code is a 40-bit shared secret — appropriate for a trusted home/office network, not for exposure to the open internet.
+- **Security is LAN-scoped.** The 8-character code is a 40-bit shared secret — appropriate for a trusted home/office network, not for exposure to the open internet. It is stored encrypted at rest (Windows DPAPI, macOS Keychain), and the stream is AES-256-GCM encrypted, but the threat model assumes trusted people on the same network.
 
 ## Documentation
 

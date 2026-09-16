@@ -266,20 +266,32 @@ final class H264Decoder {
     }
 
     private func makeBlockBuffer(_ data: Data) -> CMBlockBuffer? {
-        var blockBuf: CMBlockBuffer?
         let count = data.count
-        CMBlockBufferCreateWithMemoryBlock(
-            allocator: nil,
-            memoryBlock: UnsafeMutableRawPointer(mutating: (data as NSData).bytes),
+        // Allocate a block buffer that OWNS its memory (memoryBlock nil + AssureMemoryNow)
+        // and copy the AVCC bytes into it. The previous version referenced the caller's
+        // Data with kCFAllocatorNull (no copy); with asynchronous decode the Data is
+        // freed before VideoToolbox reads it, so it decoded freed/recycled memory —
+        // producing on-screen corruption with no packet loss and no decode error.
+        var blockBuf: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
             blockLength: count,
-            blockAllocator: kCFAllocatorNull,
+            blockAllocator: kCFAllocatorDefault,
             customBlockSource: nil,
             offsetToData: 0,
             dataLength: count,
-            flags: 0,
-            blockBufferOut: &blockBuf
-        )
-        return blockBuf
+            flags: kCMBlockBufferAssureMemoryNowFlag,
+            blockBufferOut: &blockBuf) == noErr,
+            let blockBuf
+        else { return nil }
+
+        let status = data.withUnsafeBytes { raw -> OSStatus in
+            guard let base = raw.baseAddress else { return -1 }
+            return CMBlockBufferReplaceDataBytes(
+                with: base, blockBuffer: blockBuf, offsetIntoDestination: 0, dataLength: count)
+        }
+        return status == noErr ? blockBuf : nil
     }
 
     deinit {

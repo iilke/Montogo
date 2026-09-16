@@ -12,6 +12,12 @@ final class VideoRenderer: NSObject, MTKViewDelegate {
     private var textureY: MTLTexture?
     private var textureCbCr: MTLTexture?
     private var textureCache: CVMetalTextureCache?
+    // The CVMetalTextures and the source pixel buffer are retained alongside the
+    // MTLTextures: releasing them lets VideoToolbox recycle the buffer while Metal is
+    // still sampling it, which corrupts the picture even with zero packet loss.
+    private var cvTexY: CVMetalTexture?
+    private var cvTexCbCr: CVMetalTexture?
+    private var currentBuffer: CVPixelBuffer?
     private var pendingTrace: FrameTrace?   // timing for the frame currently in textureY/CbCr
     private let lock = NSLock()
 
@@ -44,8 +50,13 @@ final class VideoRenderer: NSObject, MTKViewDelegate {
 
         super.init()
         mtkView.delegate = self
-        mtkView.isPaused = true
-        mtkView.enableSetNeedsDisplay = true
+        // Render continuously at the display refresh, always drawing the latest decoded
+        // frame. On-demand redraws (setNeedsDisplay per frame, dispatched to the main
+        // thread) beat against vsync and capped the Mac to ~30 fps; a display-linked draw
+        // locks it to a smooth 60 and decouples the display from network arrival jitter.
+        mtkView.isPaused = false
+        mtkView.enableSetNeedsDisplay = false
+        mtkView.preferredFramesPerSecond = 60
     }
 
     // Called from the decoder's callback; safe to call from any thread.
@@ -57,14 +68,16 @@ final class VideoRenderer: NSObject, MTKViewDelegate {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
 
-        textureY   = makeTexture(cache: cache, buffer: pixelBuffer, plane: 0, format: .r8Unorm, width: width,     height: height)
-        textureCbCr = makeTexture(cache: cache, buffer: pixelBuffer, plane: 1, format: .rg8Unorm, width: width/2, height: height/2)
-        pendingTrace = trace
-    }
-
-    // Ask the MTKView to redraw after a new frame is set.
-    func setNeedsDisplay(_ view: MTKView) {
-        DispatchQueue.main.async { view.setNeedsDisplay(view.bounds) }
+        let cvY = makeTexture(cache: cache, buffer: pixelBuffer, plane: 0, format: .r8Unorm, width: width,     height: height)
+        let cvC = makeTexture(cache: cache, buffer: pixelBuffer, plane: 1, format: .rg8Unorm, width: width/2, height: height/2)
+        // Retain the CVMetalTextures and the source pixel buffer until the next frame
+        // replaces them (and, in draw(), until the GPU finishes rendering this one).
+        cvTexY        = cvY
+        cvTexCbCr     = cvC
+        currentBuffer = pixelBuffer
+        textureY      = cvY.flatMap { CVMetalTextureGetTexture($0) }
+        textureCbCr   = cvC.flatMap { CVMetalTextureGetTexture($0) }
+        pendingTrace  = trace
     }
 
     // MARK: - MTKViewDelegate
@@ -75,6 +88,11 @@ final class VideoRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         let y = textureY
         let cbcr = textureCbCr
+        // Hold the frame's backing objects locally so they survive until the GPU has
+        // finished sampling them (retained in the completion handler below).
+        let heldBuf = currentBuffer
+        let heldY   = cvTexY
+        let heldC   = cvTexCbCr
         // Consume the trace so a redraw with the same textures (e.g. on resize)
         // is not logged twice.
         let trace = pendingTrace
@@ -95,10 +113,12 @@ final class VideoRenderer: NSObject, MTKViewDelegate {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
 
-        // Report timing once the GPU has actually finished the frame — the truest
-        // "on screen" moment for the render stage and total end-to-end latency.
-        if let trace, trace.firstChunk > 0 {
-            cmdBuf.addCompletedHandler { _ in
+        // Retain the decoded buffer + textures until the GPU has actually finished the
+        // frame (prevents VideoToolbox recycling the buffer mid-render), and report
+        // timing at that same "on screen" moment when this frame carried a trace.
+        cmdBuf.addCompletedHandler { _ in
+            _ = (heldBuf, heldY, heldC)   // keep alive through GPU completion
+            if let trace, trace.firstChunk > 0 {
                 let onScreen = CACurrentMediaTime()
                 FrameTimingLog.shared.record(
                     reassembly: trace.complete  - trace.firstChunk,
@@ -117,16 +137,19 @@ final class VideoRenderer: NSObject, MTKViewDelegate {
 
     // MARK: - Helpers
 
+    // Returns the CVMetalTexture (not just the MTLTexture) so the caller can retain it
+    // for the frame's lifetime — the MTLTexture is backed by the CVMetalTexture's
+    // IOSurface and is only valid while that (and the source pixel buffer) live.
     private func makeTexture(cache: CVMetalTextureCache,
                              buffer: CVPixelBuffer,
                              plane: Int,
                              format: MTLPixelFormat,
                              width: Int,
-                             height: Int) -> MTLTexture? {
+                             height: Int) -> CVMetalTexture? {
         var ref: CVMetalTexture?
         CVMetalTextureCacheCreateTextureFromImage(nil, cache, buffer, nil,
                                                  format, width, height, plane, &ref)
-        return ref.flatMap { CVMetalTextureGetTexture($0) }
+        return ref
     }
 
     // MARK: - Inline Metal shaders

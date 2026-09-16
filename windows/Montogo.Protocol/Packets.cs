@@ -18,7 +18,9 @@ public struct VideoChunkHeader
     public ushort ChunkTotal;
     public ushort PayloadLength; // ciphertext + 16-byte GCM tag (i.e. plaintext_len + 16)
     public byte Flags;           // bit 0 = IDR frame
-    public byte Reserved;
+    public byte FecTotal;        // number of FEC parity packets for this frame (0 = none).
+                                 // A packet is parity when ChunkIndex >= ChunkTotal;
+                                 // its stripe g = ChunkIndex - ChunkTotal.
 }
 
 /// <summary>
@@ -43,6 +45,24 @@ public struct HeartbeatPacket
     public ulong TimestampUs;
     public uint SequenceNum;
 }
+
+/// <summary>
+/// Mac → Windows link-quality report, sent a few times per second. Authenticated with
+/// the same ClientId + HMAC token as the handshake so only the paired Mac can steer the
+/// encoder. LossPermille is packet loss over the last interval in 0…1000 (‰).
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public struct FeedbackPacket
+{
+    public ushort Magic;
+    public byte Version;
+    public byte PacketType;      // 0x13
+    public Guid ClientId;        // 16 bytes
+    public HandshakeToken Token; // 16 bytes; HMAC-SHA256(authKey, clientId)[0..15]
+    public ushort LossPermille;  // 0..1000 packet loss over the last window
+    public byte Fps;             // rendered fps (diagnostics)
+    public byte Reserved;
+}                                // total: 40 bytes
 
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct HandshakeRequestPacket

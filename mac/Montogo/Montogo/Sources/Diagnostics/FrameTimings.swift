@@ -15,12 +15,26 @@ struct FrameTrace {
     var chunks:     Int = 0            // number of UDP packets this frame was split into
 }
 
+// Compact snapshot of link health for the on-screen monitor, emitted once per
+// window. Sendable so it can hop to the main actor for SwiftUI.
+struct LinkStats: Equatable, Sendable {
+    var fps: Double
+    var latencyAvgMs: Double
+    var latencyMaxMs: Double
+    var lossPct: Double
+    var decodeErrors: Int
+}
+
 // Thread-safe aggregator. Collects the four pipeline stages and prints a
 // min / avg / max summary every `window` frames, then resets.
 // Instrumentation only — set `enabled = false` to silence with near-zero cost.
 final class FrameTimingLog {
     static let shared = FrameTimingLog()
     static var enabled = true
+
+    /// Live link-health callback for the on-screen monitor. Invoked on a background
+    /// thread once per window; the consumer marshals to the main actor.
+    static var onLiveStats: ((LinkStats) -> Void)?
 
     private let lock = NSLock()
     private let window = 60
@@ -108,15 +122,22 @@ final class FrameTimingLog {
 
         // Packet loss: over the window the sender's SequenceNum is contiguous, so the
         // expected count is (max - min + 1); anything missing was lost in transit.
+        var lossPct = 0.0
         var lossStr = "n/a"
         if let sMin, sMax >= sMin {
             let expected = Int(sMax - sMin) + 1
             let lost = max(0, expected - seen)
-            let pct = expected > 0 ? Double(lost) * 100.0 / Double(expected) : 0
-            lossStr = String(format: "%.1f%% (%d lost / %d expected, %d received)", pct, lost, expected, seen)
+            lossPct = expected > 0 ? Double(lost) * 100.0 / Double(expected) : 0
+            lossStr = String(format: "%.1f%% (%d lost / %d expected, %d received)", lossPct, lost, expected, seen)
         }
         // Rendered-frame rate: this window's frames over its wall-clock span.
         let fps = elapsed > 0 ? Double(t.count) / elapsed : 0
+
+        // Push a live snapshot to the on-screen monitor (end-to-end latency, fps, loss).
+        let latAvg = t.isEmpty ? 0 : t.reduce(0, +) / Double(t.count) * 1000
+        let latMax = (t.max() ?? 0) * 1000
+        FrameTimingLog.onLiveStats?(LinkStats(
+            fps: fps, latencyAvgMs: latAvg, latencyMaxMs: latMax, lossPct: lossPct, decodeErrors: decErr))
 
         print("""
         [FrameTiming] last \(t.count) frames  (rendered \(String(format: "%.1f", fps)) fps)

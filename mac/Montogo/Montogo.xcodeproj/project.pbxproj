@@ -15,6 +15,7 @@
 		A10000006 /* StreamingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000006 /* StreamingView.swift */; };
 		A10000007 /* ConnectionCode.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000007 /* ConnectionCode.swift */; };
 		A10000008 /* AuthToken.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000008 /* AuthToken.swift */; };
+		A10000018 /* ConnectionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000018 /* ConnectionStore.swift */; };
 		A10000009 /* Protocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000009 /* Protocol.swift */; };
 		A10000010 /* FrameAssembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010 /* FrameAssembler.swift */; };
 		A10000011 /* StreamDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000011 /* StreamDecryptor.swift */; };
@@ -40,6 +41,7 @@
 		A20000006 /* StreamingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingView.swift; sourceTree = "<group>"; };
 		A20000007 /* ConnectionCode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionCode.swift; sourceTree = "<group>"; };
 		A20000008 /* AuthToken.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthToken.swift; sourceTree = "<group>"; };
+		A20000018 /* ConnectionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStore.swift; sourceTree = "<group>"; };
 		A20000009 /* Protocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Protocol.swift; sourceTree = "<group>"; };
 		A20000010 /* FrameAssembler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameAssembler.swift; sourceTree = "<group>"; };
 		A20000011 /* StreamDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamDecryptor.swift; sourceTree = "<group>"; };
@@ -121,6 +123,7 @@
 			children = (
 				A20000007 /* ConnectionCode.swift */,
 				A20000008 /* AuthToken.swift */,
+				A20000018 /* ConnectionStore.swift */,
 			);
 			path = Sources/Security;
 			sourceTree = "<group>";
@@ -249,6 +252,7 @@
 				A10000006 /* StreamingView.swift in Sources */,
 				A10000007 /* ConnectionCode.swift in Sources */,
 				A10000008 /* AuthToken.swift in Sources */,
+				A10000018 /* ConnectionStore.swift in Sources */,
 				A10000009 /* Protocol.swift in Sources */,
 				A10000010 /* FrameAssembler.swift in Sources */,
 				A10000011 /* StreamDecryptor.swift in Sources */,

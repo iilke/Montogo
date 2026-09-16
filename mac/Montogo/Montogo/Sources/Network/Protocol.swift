@@ -4,7 +4,7 @@ import Foundation
 
 enum MontogoProtocol {
     static let magic: UInt16 = 0x474D
-    static let version: UInt8 = 2
+    static let version: UInt8 = 4   // v4: Reed–Solomon FEC (systematic, GF(256))
     static let port: UInt16 = 47921
     static let maxChunkPayload = 1400
     static let gcmTagSize = 16
@@ -19,6 +19,7 @@ enum PacketType: UInt8 {
     case heartbeat         = 0x10
     case handshakeRequest  = 0x11
     case handshakeResponse = 0x12
+    case feedback          = 0x13   // Mac → Windows: measured loss, drives adaptive bitrate
 }
 
 // MARK: - Packet builders
@@ -51,6 +52,26 @@ struct HeartbeatPacket {
         let ts = UInt64(Date().timeIntervalSince1970 * 1_000_000)
         pkt.write(ts, at: 4)
         pkt.write(seq, at: 12)
+        return pkt
+    }
+}
+
+// Mac → Windows link-quality report. Layout mirrors the C# FeedbackPacket (Pack=1):
+// magic(2) version(1) type(1) clientId(16) token(16) lossPermille(2) fps(1) reserved(1).
+struct FeedbackPacket {
+    static let size = 40
+
+    static func build(clientId: UUID, authToken: Data, lossPermille: UInt16, fps: UInt8) -> Data {
+        var pkt = Data(count: size)
+        pkt.write(MontogoProtocol.magic, at: 0)
+        pkt[2] = MontogoProtocol.version
+        pkt[3] = PacketType.feedback.rawValue
+        var uuidBytes = clientId.uuid
+        Swift.withUnsafeBytes(of: &uuidBytes) { buf in pkt.replaceSubrange(4..<20, with: buf) }
+        pkt.replaceSubrange(20..<36, with: authToken)
+        pkt.write(lossPermille, at: 36)
+        pkt[38] = fps
+        pkt[39] = 0
         return pkt
     }
 }
@@ -97,7 +118,11 @@ struct VideoChunkHeader {
     let chunkTotal: UInt16
     let payloadLength: UInt16
     let flags: UInt8
+    let fecTotal: UInt8    // number of FEC parity packets for this frame (0 = none)
     let isIDR: Bool
+
+    // A packet is FEC parity when chunkIndex >= chunkTotal; its stripe is chunkIndex - chunkTotal.
+    var isParity: Bool { chunkIndex >= chunkTotal }
 
     static func parse(_ data: Data) -> VideoChunkHeader? {
         guard data.count >= size,
@@ -112,9 +137,10 @@ struct VideoChunkHeader {
         let ct      = data.read(UInt16.self, at: 22)
         let pl      = data.read(UInt16.self, at: 24)
         let flags   = data[26]
+        let fec     = data[27]
         return VideoChunkHeader(sequenceNum: seq, frameId: frameId, timestampUs: ts,
                                 chunkIndex: ci, chunkTotal: ct, payloadLength: pl,
-                                flags: flags, isIDR: (flags & 1) != 0)
+                                flags: flags, fecTotal: fec, isIDR: (flags & 1) != 0)
     }
 }
 

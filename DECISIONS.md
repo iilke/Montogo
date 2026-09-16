@@ -124,9 +124,11 @@ Implemented in `Montogo.App/CliPathResolver.cs`. `DriverLocator.TryFindRelative(
 
 On exit (`ExitApplication`): cancel the CTS, stop capture, complete the channel, drain the pipeline task (2 s timeout), dispose encoder and sender, call `RemoveAllAsync`.
 
-**`AppSettings`:** serialized to/from `%APPDATA%\Montogo\settings.json` via `System.Text.Json`. Two fields: `DriverCliPath` (nullable, falls back to relative path) and `SharedSecret` (the 8-character connection code; generated once on first launch, never changes unless the file is deleted).
+**`AppSettings`:** serialized to/from `%APPDATA%\Montogo\settings.json` via `System.Text.Json`. Fields: `DriverCliPath` (nullable, falls back to relative path) and `SharedSecret`. `SharedSecret` holds the connection code **encrypted at rest with DPAPI** (`ProtectedData`, `DataProtectionScope.CurrentUser` + a fixed app entropy), stored as base64 — never the plaintext. `GetOrCreateConnectionCode()` generates+encrypts on first launch and decrypts on read; a legacy plaintext value (detected because it isn't valid base64/DPAPI — the code always has a `-`) is transparently migrated to the encrypted form and rewritten. `SetConnectionCode()` re-encrypts a replacement (used by the tray reset). Requires the `System.Security.Cryptography.ProtectedData` NuGet package (DPAPI is not in-box on net8).
 
-**`SecurityContext`:** created at startup from the connection code. Derives `EncKey` and `AuthKey` via HKDF-SHA256, constructs the `AesGcm` cipher used by `UdpSender`. Exposes `ConnectionCode` (displayed in the tray menu), `Cipher` (given to `UdpSender`), and `ValidateToken` (called in the handshake loop). Implements `IDisposable` to release the `AesGcm` instance.
+**`SecurityContext`:** created at startup from the connection code. Derives `EncKey` and `AuthKey` via HKDF-SHA256, constructs the `AesGcm` cipher used by `UdpSender`. Exposes `ConnectionCode` (displayed in the tray menu), `Cipher` (given to `UdpSender`), and `ValidateToken` (called in the handshake loop). Implements `IDisposable` to release the `AesGcm` instance. The `_security` field is **not** readonly — the tray "Reset connection code" action swaps in a fresh instance at runtime (reference read/write is atomic, so the handshake loop reads it lock-free).
+
+**Tray menu:** `Code:` (the connection code), a status line, **Security log** (last 10 wrong-token attempts — timestamp, source IP, running attempt #; kept in memory behind a lock, shown in a `MessageBox`), **Reset connection code** (confirm → new 5-byte secret → DPAPI-encrypt+save → swap `_security` → update the code display → tear the live pipeline down via `TearDownPipeline` on a background thread so the Mac disconnects and its old-code handshake is rejected), and **Exit**. `RecordRejectedAttempt` is called from the handshake loop's invalid-token branch. `TearDownPipeline` stops capture / completes the channel / drains the pipeline task / disposes encoder+sender and nulls them — **without** touching `_listener` or the handshake loop — so the next authenticated handshake starts a fresh session.
 
 **`CliPathResolver`:** resolution order: (1) `driver\virtual-display-driver-cli.exe` next to the exe, (2) `DriverCliPath` in settings. Validates that the settings path ends with `DriverLocator.CliName` (case-insensitive) before accepting it.
 
@@ -267,6 +269,15 @@ Every `VideoChunk` payload is encrypted with AES-256-GCM (16-byte tag). Nonce = 
 
 `LanIpResolver.GetLanAddress()` selects the most appropriate local IPv4 address: must be `OperationalStatus.Up`, non-loopback, non-virtual (filters Hyper-V, WSL, VirtualBox by NIC name/description), and in a private range (10/8, 172.16/12, 192.168/16). Falls back to `IPAddress.Any` with a tray warning if no private LAN address is found.
 
+### At-rest secret storage
+
+The connection code is the master secret, so it is never persisted in plaintext:
+
+- **Windows** — `AppSettings` encrypts it with DPAPI (`ProtectedData`, `DataProtectionScope.CurrentUser`) before writing `settings.json`; only the same Windows user account can decrypt it. Legacy plaintext values are migrated on first read. (See the `AppSettings` note above.)
+- **Mac** — `ConnectionStore` stores it in the macOS **Keychain** (`SecItemAdd`/`Update`/`CopyMatching`/`Delete`, service `com.montogo.app`, account `connection-code`). The Windows IP is not sensitive and goes to `UserDefaults`.
+
+Both are local-at-rest protections; the wire protocol and threat model are unchanged.
+
 ---
 
 ## Montogo.Encoding
@@ -376,6 +387,7 @@ SwiftUI app implementing the receive side of PROTOCOL.md manually (no code shari
 - **Decode (`H264Decoder`):** wraps `VTDecompressionSession` with `_EnableAsynchronousDecompression` and `kVTDecompressionPropertyKey_RealTime`. Each reassembled frame is an Annex B access unit **split into all its NALUs**: SPS/PPS (re)build the format description on IDR frames; every frame's NALs are converted to length-prefixed AVCC (dropping the AUD) for the sample. **The single biggest bug of the project lived here** — the P-frame path treated a multi-NAL access unit (AUD + slice) as one NAL, producing a malformed sample VideoToolbox silently rejected, so *every* P-frame failed and only keyframes rendered (~1 fps, which presented as "the encoder is producing 170 Mbps"). See `PROTOCOL.md` receiver checklist step 7.
 - **Render (`VideoRenderer`):** a Metal `MTKView` + CoreVideo Metal texture cache; a fragment shader does BT.601 limited-range YCbCr→RGB. `present()` stores the latest frame's Y/CbCr textures; `draw()` renders on the next `setNeedsDisplay`. Frame timing is stamped in the command-buffer completion handler (true on-screen time).
 - **Diagnostics (`FrameTimings`):** a `FrameTrace` is threaded through reassembly → decode → render; `FrameTimingLog` prints per-60-frame min/avg/max for each stage plus rendered fps, packet-loss % (gaps in the continuous `SequenceNum`), decrypt failures, and decode submit/error counts. This instrumentation is what localized the P-frame bug (0% loss + 0.5 fps + all P-frame decode errors). Gate off with `FrameTimingLog.enabled = false`.
+- **Persistence / auto-reconnect (`ConnectionStore`, `AppViewModel`):** on a successful handshake the code (Keychain) and IP (`UserDefaults`) are saved. `AppViewModel.bootstrap()` (called from `ContentView.onAppear`, guarded to run once) auto-connects from the saved pairing, skipping the setup screen. An `isAuto` connect starts an **~8 s** timeout task; if `.connected` isn't reached, it stops and shows the setup screen with the saved code/IP pre-filled (so a changed IP is a quick fix). `forget()` clears the store and returns to a blank setup — reachable from a "Connection ▸ Forget This Connection" menu command (⇧⌘K) and on-screen buttons on the connecting/disconnected screens. `disconnect()` returns to setup but keeps the saved pairing (so a relaunch still auto-connects).
 
 ---
 

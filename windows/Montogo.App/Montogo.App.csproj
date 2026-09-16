@@ -8,6 +8,13 @@
     <ProjectReference Include="..\Montogo.Protocol\Montogo.Protocol.csproj" />
   </ItemGroup>
 
+  <!-- DPAPI (ProtectedData) is not in the shared framework on .NET 8; it ships as
+       a NuGet package even for Windows-targeted apps. Used to encrypt the connection
+       code at rest in settings.json. -->
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>

@@ -25,6 +25,10 @@ public sealed class H264Encoder : IDisposable
     private byte[]? _nv12;
     private long _frameDurationHns;
     private bool _started;
+    // Hardware NVENC advertises ARGB32 input, so we hand it the DXGI BGRA bytes straight
+    // and let the GPU do the colour conversion — dropping the crude CPU BgraToNv12 step.
+    // The software fallback MFT only takes NV12, so it keeps the CPU conversion.
+    private bool _argbInput;
 
     // Software MFTs require caller-allocated output samples; the sample and its
     // buffer are created once in Initialize and reused for every ProcessOutput.
@@ -40,6 +44,7 @@ public sealed class H264Encoder : IDisposable
     // on the next frame (set from the handshake thread, applied on the pipeline thread).
     private ICodecAPI? _codecApi;
     private int _forceKeyframe;
+    private int _pendingBitrate;   // 0 = none; set cross-thread, applied on the pump thread
 
     /// <summary>True if the active encoder is a hardware GPU encoder (NVENC / Quick Sync / AMF).</summary>
     public bool IsHardwareAccelerated { get; private set; }
@@ -150,7 +155,7 @@ public sealed class H264Encoder : IDisposable
             {
                 try
                 {
-                    PrepareMft(hwMft);
+                    PrepareMft(hwMft, hardware: true);
                     Trace.WriteLine("[Montogo.Encoding] Using hardware H.264 encoder MFT");
                     return (hwMft, IsHardware: true);
                 }
@@ -170,7 +175,7 @@ public sealed class H264Encoder : IDisposable
         Trace.WriteLine("[Montogo.Encoding] No hardware H.264 encoder found; falling back to Microsoft software MFT");
         var softType = Type.GetTypeFromCLSID(SoftwareClsid, throwOnError: true)!;
         var softMft  = (IMFTransform)Activator.CreateInstance(softType)!;
-        PrepareMft(softMft);
+        PrepareMft(softMft, hardware: false);
         return (softMft, IsHardware: false);
     }
 
@@ -178,7 +183,7 @@ public sealed class H264Encoder : IDisposable
     /// Unlocks async MFTs, applies low-latency codec settings, and negotiates types.
     /// Order matters: an async MFT rejects most IMFTransform calls until unlocked.
     /// </summary>
-    private void PrepareMft(IMFTransform mft)
+    private void PrepareMft(IMFTransform mft, bool hardware)
     {
         mft.GetAttributes(out IMFAttributes attrs);
         uint isAsync = 0;
@@ -192,7 +197,7 @@ public sealed class H264Encoder : IDisposable
 
         // Rate-control settings must be applied AFTER the output type is set —
         // SetOutputType otherwise resets them, so an earlier CBR request is lost.
-        SetupTypesOn(mft);
+        SetupTypesOn(mft, hardware);
         TryConfigureCodec(mft);
     }
 
@@ -221,7 +226,13 @@ public sealed class H264Encoder : IDisposable
         Set("MaxBitRate",          CodecApiGuids.AVEncCommonMaxBitRate, (uint)_options.BitrateBps);
         Set("BufferSize",          CodecApiGuids.AVEncCommonBufferSize, (uint)(_options.BitrateBps / 4));
         Set("LowLatencyMode",      CodecApiGuids.AVLowLatencyMode, true);
-        Set("QualityVsSpeed",      CodecApiGuids.AVEncCommonQualityVsSpeed, 0u);
+        // No B-frames. The Mac decoder assumes a plain IPPP stream and its renderer presents
+        // frames in decode order, so B-frame reordering (decode order != display order) is
+        // what shredded the picture when QualityVsSpeed was raised before. Pinning B-pictures
+        // to 0 keeps the stream reorder-free, so we can now raise QualityVsSpeed for a cleaner
+        // encode (more motion search / better mode decisions) without breaking the decoder.
+        Set("BPictureCount=0",     CodecApiGuids.AVEncMPVDefaultBPictureCount, 0u);
+        Set("QualityVsSpeed",      CodecApiGuids.AVEncCommonQualityVsSpeed, 60u);
         // (Keyframe interval is set on the output media type — see SetupTypesOn.
         //  The NVENC MFT ignores both that and the ICodecAPI GOP-size property and
         //  always emits ~1 keyframe/sec, so a shorter GOP can't be forced here.)
@@ -234,7 +245,14 @@ public sealed class H264Encoder : IDisposable
     /// </summary>
     public void RequestKeyFrame() => Interlocked.Exchange(ref _forceKeyframe, 1);
 
-    private void SetupTypesOn(IMFTransform mft)
+    /// <summary>
+    /// Requests a new target bitrate (bits/sec), applied to CBR mean/max/VBV on the next
+    /// submitted frame. Thread-safe — the adaptive controller calls this from the feedback
+    /// path; the actual ICodecAPI writes happen on the pump thread inside SubmitFrame.
+    /// </summary>
+    public void SetBitrate(int bitsPerSecond) => Interlocked.Exchange(ref _pendingBitrate, bitsPerSecond);
+
+    private void SetupTypesOn(IMFTransform mft, bool hardware)
     {
         // Output (H.264) must be set before input (NV12) — MFT rejects the reverse order
         PInvoke.MFCreateMediaType(out IMFMediaType outputType).ThrowOnFailure();
@@ -252,13 +270,24 @@ public sealed class H264Encoder : IDisposable
         outputType.SetUINT32(PInvoke.MF_MT_MAX_KEYFRAME_SPACING, (uint)(_options.Fps * 4));
         mft.SetOutputType(0, outputType, 0);
 
+        // Hardware NVENC accepts ARGB32 (our DXGI BGRA) and converts on the GPU; the
+        // software MFT only takes NV12. _argbInput records which, so SubmitFrame feeds the
+        // matching bytes.
+        _argbInput = hardware;
+        Guid inputSubtype = hardware
+            ? new Guid("00000015-0000-0010-8000-00aa00389b71")   // MFVideoFormat_ARGB32
+            : PInvoke.MFVideoFormat_NV12;
+
         PInvoke.MFCreateMediaType(out IMFMediaType inputType).ThrowOnFailure();
         inputType.SetGUID(PInvoke.MF_MT_MAJOR_TYPE, PInvoke.MFMediaType_Video);
-        inputType.SetGUID(PInvoke.MF_MT_SUBTYPE, PInvoke.MFVideoFormat_NV12);
+        inputType.SetGUID(PInvoke.MF_MT_SUBTYPE, inputSubtype);
         inputType.SetUINT64(PInvoke.MF_MT_FRAME_SIZE, PackRatio(_options.Width, _options.Height));
         inputType.SetUINT64(PInvoke.MF_MT_FRAME_RATE, PackRatio(_options.Fps, 1));
         inputType.SetUINT32(PInvoke.MF_MT_INTERLACE_MODE, 2);
         inputType.SetUINT64(PInvoke.MF_MT_PIXEL_ASPECT_RATIO, PackRatio(1, 1));
+        // ARGB32 needs an explicit stride; positive = top-down, matching DXGI's row order.
+        if (hardware)
+            inputType.SetUINT32(PInvoke.MF_MT_DEFAULT_STRIDE, (uint)(_options.Width * 4));
         mft.SetInputType(0, inputType, 0);
     }
 
@@ -277,14 +306,38 @@ public sealed class H264Encoder : IDisposable
             catch { }
         }
 
-        BgraToNv12(bgraData, _nv12!, _options.Width, _options.Height);
+        // Apply a pending adaptive-bitrate change (CBR mean/max + tight VBV) on this thread.
+        int newBitrate = Interlocked.Exchange(ref _pendingBitrate, 0);
+        if (newBitrate > 0 && _codecApi is not null)
+        {
+            try
+            {
+                object mean = (uint)newBitrate;       _codecApi.SetValue(CodecApiGuids.AVEncCommonMeanBitRate, ref mean);
+                object max  = (uint)newBitrate;       _codecApi.SetValue(CodecApiGuids.AVEncCommonMaxBitRate,  ref max);
+                object buf  = (uint)(newBitrate / 4); _codecApi.SetValue(CodecApiGuids.AVEncCommonBufferSize,  ref buf);
+            }
+            catch { }
+        }
 
-        uint nv12Size = (uint)_nv12!.Length;
-        PInvoke.MFCreateMemoryBuffer(nv12Size, out IMFMediaBuffer buffer).ThrowOnFailure();
+        // Hardware path: hand the encoder the raw BGRA and let the GPU convert. Software
+        // path: convert to NV12 on the CPU first.
+        ReadOnlySpan<byte> src;
+        if (_argbInput)
+        {
+            src = bgraData;
+        }
+        else
+        {
+            BgraToNv12(bgraData, _nv12!, _options.Width, _options.Height);
+            src = _nv12;
+        }
+
+        uint size = (uint)src.Length;
+        PInvoke.MFCreateMemoryBuffer(size, out IMFMediaBuffer buffer).ThrowOnFailure();
         buffer.Lock(out byte* ptr);
-        try { _nv12.AsSpan().CopyTo(new Span<byte>(ptr, (int)nv12Size)); }
+        try { src.CopyTo(new Span<byte>(ptr, (int)size)); }
         finally { buffer.Unlock(); }
-        buffer.SetCurrentLength(nv12Size);
+        buffer.SetCurrentLength(size);
 
         PInvoke.MFCreateSample(out IMFSample sample).ThrowOnFailure();
         sample.AddBuffer(buffer);
@@ -402,8 +455,14 @@ public sealed class H264Encoder : IDisposable
                     y1[0] = (byte)(((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16);
                     y1[1] = (byte)(((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16);
 
-                    int u = ((-38 * r00 - 74 * g00 + 112 * b00 + 128) >> 8) + 128;
-                    int v = ((112 * r00 - 94 * g00 -  18 * b00 + 128) >> 8) + 128;
+                    // Average the 2×2 block's colour for chroma (proper 4:2:0 box downsampling).
+                    // Point-sampling only the top-left pixel aliased fine detail into coloured
+                    // speckle on edges; the average removes that at zero decode-side cost.
+                    int rA = (r00 + r01 + r10 + r11 + 2) >> 2;
+                    int gA = (g00 + g01 + g10 + g11 + 2) >> 2;
+                    int bA = (b00 + b01 + b10 + b11 + 2) >> 2;
+                    int u = ((-38 * rA - 74 * gA + 112 * bA + 128) >> 8) + 128;
+                    int v = ((112 * rA - 94 * gA -  18 * bA + 128) >> 8) + 128;
                     uv[0] = (byte)Math.Clamp(u, 0, 255);
                     uv[1] = (byte)Math.Clamp(v, 0, 255);
 

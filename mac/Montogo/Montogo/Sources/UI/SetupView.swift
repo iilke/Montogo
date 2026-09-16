@@ -88,7 +88,13 @@ struct SetupView: View {
                 Spacer()
             }
         }
-        .onAppear { focusedField = .code }
+        .onAppear {
+            // Pre-fill with the last-used values (from Keychain + UserDefaults) so the
+            // user only fixes what changed; focus the first empty field.
+            if codeField.isEmpty { codeField = vm.prefillCode }
+            if ipField.isEmpty   { ipField   = vm.prefillIP }
+            focusedField = codeField.isEmpty ? .code : .ip
+        }
     }
 
     private func connect() {

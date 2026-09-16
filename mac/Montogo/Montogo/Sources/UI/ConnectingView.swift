@@ -21,6 +21,10 @@ struct ConnectingView: View {
                     .buttonStyle(.borderless)
                     .foregroundStyle(.white.opacity(0.6))
                     .padding(.top, 8)
+
+                Button("Forget This Connection") { vm.forget() }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.white.opacity(0.4))
             }
         }
     }
