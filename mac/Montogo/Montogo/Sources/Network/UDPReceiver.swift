@@ -36,6 +36,16 @@ actor UDPReceiver {
     private var fbSeqMax: UInt32 = 0
     private var fbCount: Int = 0
 
+    // Frame-ordering gate for fast gap recovery. Frames form an IPPP chain, so a missing
+    // frameId (lost in transit or dropped in Windows's send queue) breaks the reference
+    // chain: the next P-frame and everything until the following keyframe fail to decode.
+    // On a gap we stop feeding the decoder broken frames and ask Windows for a keyframe
+    // immediately (out-of-band + a flag on the periodic feedback), which re-syncs in ~1 RTT
+    // instead of freezing until the next periodic keyframe.
+    private var expectedFrameId: UInt32?
+    private var awaitingKeyframe = false
+    private var lastKeyframeRequest: Date = .distantPast
+
     var onStateChange: ((ConnectionState) -> Void)?
     var onFrame: ((UInt32, Data, Bool, FrameTrace) -> Void)?
 
@@ -183,6 +193,10 @@ actor UDPReceiver {
         handshakeTimer?.cancel()
         handshakeTimer = nil
         decryptor.setNoncePrefix(resp.noncePrefix)
+        // Fresh session: discard any stale frame-ordering state and wait for the keyframe
+        // Windows forces on (re)connect before decoding P-frames.
+        expectedFrameId = nil
+        awaitingKeyframe = true
         onStateChange?(.connected(fps: resp.targetFps, width: resp.displayWidth, height: resp.displayHeight))
         startHeartbeat()
         startWatchdog()
@@ -226,8 +240,48 @@ actor UDPReceiver {
         guard let plaintext else { return }
         if let (frameId, nalData, isIDR, trace) = assembler.add(header: header, plaintext: plaintext,
                                                                 recvTime: recvTime) {
-            onFrame?(frameId, nalData, isIDR, trace)
+            gateAndDeliver(frameId, nalData, isIDR, trace)
         }
+    }
+
+    // Enforces in-order, gap-free delivery of the IPPP frame chain. A keyframe always
+    // re-syncs; a P-frame is delivered only if it's the next expected id. A gap (or the
+    // pre-first-IDR state) means the reference chain is broken, so P-frames are dropped
+    // until a keyframe arrives and Windows is asked to send one now.
+    private func gateAndDeliver(_ frameId: UInt32, _ nalData: Data, _ isIDR: Bool, _ trace: FrameTrace) {
+        if isIDR {
+            expectedFrameId = frameId &+ 1
+            awaitingKeyframe = false
+            onFrame?(frameId, nalData, isIDR, trace)
+            return
+        }
+        guard !awaitingKeyframe, let expected = expectedFrameId else {
+            // No valid reference (broken chain, or no IDR seen yet): drop and request a key.
+            if !awaitingKeyframe { awaitingKeyframe = true }
+            requestKeyframeNow()
+            return
+        }
+        if frameId == expected {
+            expectedFrameId = frameId &+ 1
+            onFrame?(frameId, nalData, isIDR, trace)
+        } else if frameId < expected {
+            return   // stale or duplicate frameId — drop
+        } else {
+            // Gap: this P-frame's reference never arrived. Stop until the next keyframe.
+            awaitingKeyframe = true
+            requestKeyframeNow()
+        }
+    }
+
+    // Sends an out-of-band feedback packet flagged to request an immediate keyframe. Rate-
+    // limited; the periodic feedback also carries the flag while awaitingKeyframe is set.
+    private func requestKeyframeNow() {
+        let now = Date()
+        guard now.timeIntervalSince(lastKeyframeRequest) >= 0.1 else { return }
+        lastKeyframeRequest = now
+        send(FeedbackPacket.build(clientId: clientId, authToken: authToken,
+                                  lossPermille: 0, fps: 0,
+                                  flags: FeedbackPacket.flagRequestKeyframe))
     }
 
     // MARK: - Heartbeat
@@ -262,8 +316,11 @@ actor UDPReceiver {
                     }
                 }
                 fbSeqMin = nil; fbSeqMax = 0; fbCount = 0
+                // Keep asking for a keyframe until the chain is healed, in case the out-of-band
+                // request was itself lost.
+                let flags: UInt8 = awaitingKeyframe ? FeedbackPacket.flagRequestKeyframe : 0
                 let pkt = FeedbackPacket.build(clientId: clientId, authToken: authToken,
-                                               lossPermille: permille, fps: 0)
+                                               lossPermille: permille, fps: 0, flags: flags)
                 send(pkt)
             }
         }

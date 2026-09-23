@@ -186,6 +186,9 @@ public sealed class DxgiCapture : IDisposable
             bool cursorVisible = false;
             int  cursorX = 0, cursorY = 0;
             bool cursorDirty = false;
+            // Set when new desktop content has been captured into lastFrame but not yet
+            // emitted (emission is rate-limited to the target fps below).
+            bool contentDirty = false;
 
             byte[] ComposeEmit()
             {
@@ -262,63 +265,70 @@ public sealed class DxgiCapture : IDisposable
                         duplication.ReleaseFrame();
                 }
 
-                if (!gotNewContent)
+                // New desktop content: copy it into lastFrame. Do NOT emit here — emission is
+                // rate-limited to the target fps in the single block below. DXGI can deliver
+                // content far faster than the target (moving the mouse pushed it to ~150 fps),
+                // and emitting every frame floods the encoder/link with frames the 60 Hz Mac
+                // display can never show, overrunning the send queue and gapping the stream.
+                if (gotNewContent)
                 {
-                    // Emitted buffers are never mutated after creation, so re-emitting
-                    // one is safe under the receiver-owns-the-buffer contract; only a
-                    // cursor change forces a fresh composite.
+                    context.Map((ID3D11Resource)staging, 0, D3D11_MAP.D3D11_MAP_READ, 0, out D3D11_MAPPED_SUBRESOURCE mapped);
+                    try
+                    {
+                        unsafe
+                        {
+                            byte* src    = (byte*)mapped.pData;
+                            int rowPitch = (int)mapped.RowPitch;
+                            int rowBytes = width * 4;
+
+                            if (rowPitch == rowBytes)
+                            {
+                                new ReadOnlySpan<byte>(src, frameData.Length).CopyTo(frameData);
+                            }
+                            else
+                            {
+                                for (int y = 0; y < height; y++)
+                                    new ReadOnlySpan<byte>(src + (long)y * rowPitch, rowBytes)
+                                        .CopyTo(frameData.AsSpan(y * rowBytes, rowBytes));
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        context.Unmap((ID3D11Resource)staging, 0);
+                    }
+
+                    // Fresh allocation per frame so CapturedFrame.BgraData is immutable and
+                    // safe to hold across threads, matching the contract in CapturedFrame.cs.
+                    byte[] frameCopy = new byte[frameData.Length];
+                    frameData.AsSpan().CopyTo(frameCopy);
+                    lastFrame    = frameCopy;
+                    contentDirty = true;
+                }
+
+                // Single rate-limited emit, decoupled from the capture rate. Emit only the
+                // newest available frame (content + current cursor), at most once per target
+                // interval. On a static desktop this re-emits the last frame to keep the
+                // stream alive; under fast content it drops the surplus instead of flooding.
+                {
                     double nowMs = pacer.Elapsed.TotalMilliseconds;
                     if (lastFrame is not null && nowMs >= nextEmitMs)
                     {
-                        if (cursorDirty || lastEmitted is null)
+                        if (contentDirty || cursorDirty || lastEmitted is null)
                         {
-                            lastEmitted = ComposeEmit();
-                            cursorDirty = false;
+                            lastEmitted  = ComposeEmit();
+                            contentDirty = false;
+                            cursorDirty  = false;
                         }
                         FrameCaptured?.Invoke(new CapturedFrame { BgraData = lastEmitted, Width = width, Height = height });
-                        nextEmitMs += frameIntervalMs;
-                        // If we fell well behind (a long stall), resync rather than bursting.
-                        if (nowMs - nextEmitMs > frameIntervalMs * 4) nextEmitMs = nowMs + frameIntervalMs;
-                    }
-                    continue;
-                }
-
-                context.Map((ID3D11Resource)staging, 0, D3D11_MAP.D3D11_MAP_READ, 0, out D3D11_MAPPED_SUBRESOURCE mapped);
-                try
-                {
-                    unsafe
-                    {
-                        byte* src    = (byte*)mapped.pData;
-                        int rowPitch = (int)mapped.RowPitch;
-                        int rowBytes = width * 4;
-
-                        if (rowPitch == rowBytes)
-                        {
-                            new ReadOnlySpan<byte>(src, frameData.Length).CopyTo(frameData);
-                        }
-                        else
-                        {
-                            for (int y = 0; y < height; y++)
-                                new ReadOnlySpan<byte>(src + (long)y * rowPitch, rowBytes)
-                                    .CopyTo(frameData.AsSpan(y * rowBytes, rowBytes));
-                        }
+                        // Schedule the next emit one interval from NOW, not from the previous
+                        // deadline. Advancing by a fixed step lets a lagged loop "catch up" by
+                        // emitting a burst of frames in one pass (seen as 100-120 fps under
+                        // heavy content), which floods the link. Relative spacing caps the
+                        // emit rate at the target fps no matter how the loop jitters.
+                        nextEmitMs = nowMs + frameIntervalMs;
                     }
                 }
-                finally
-                {
-                    context.Unmap((ID3D11Resource)staging, 0);
-                }
-
-                // Fresh allocation per frame so CapturedFrame.BgraData is immutable and
-                // safe to hold across threads, matching the contract in CapturedFrame.cs.
-                byte[] frameCopy = new byte[frameData.Length];
-                frameData.AsSpan().CopyTo(frameCopy);
-                lastFrame   = frameCopy;
-                lastEmitted = ComposeEmit();
-                cursorDirty = false;
-                FrameCaptured?.Invoke(new CapturedFrame { BgraData = lastEmitted, Width = width, Height = height });
-                // A real frame just went out — schedule the next idle re-emit one interval on.
-                nextEmitMs = pacer.Elapsed.TotalMilliseconds + frameIntervalMs;
             }
         }
         finally

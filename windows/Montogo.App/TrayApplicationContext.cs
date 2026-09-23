@@ -58,11 +58,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private Task?        _sendTask;
     private Task?        _keyframeTask;   // forces a periodic IDR so P-frame error can't accumulate
 
-    // Adaptive bitrate — AIMD congestion control driven by the Mac's loss feedback.
-    private int      _adaptiveMax;                    // ceiling = configured target bitrate
+    // Adaptive bitrate — AIMD congestion control driven by the Mac's loss feedback AND the
+    // local send-queue depth (see OnSendQueueDepth). The Mac's feedback is loss-based, but
+    // when the Wi-Fi link saturates the frames pile up in _sendChannel and get dropped HERE,
+    // before the network — so the Mac sees 0% loss and the loss path never reacts. The
+    // send-queue signal covers that blind spot.
+    private int      _adaptiveMax;                    // hard ceiling = configured target bitrate
     private int      _adaptiveBitrate;                // current adaptive target
+    private int      _softCeiling;                    // learned link-capacity estimate ≤ _adaptiveMax
     private DateTime _lastAdapt = DateTime.MinValue;
+    private DateTime _lastCongestion = DateTime.MinValue; // last time the link showed it was overdriven
     private const int AdaptiveMinBitrate = 2_000_000; // don't starve below ~2 Mbps
+
+    // _sendChannel holds 16 frames. When it backs up past this, the send loop can't keep the
+    // link fed at the current bitrate: DropOldest is (about to be) discarding a frame, which
+    // punches a frameId gap that breaks the Mac's P-frame reference chain (a -12909 cascade).
+    private const int SendQueueHighWater = 8;
+    private DateTime _lastSendPressureKeyframe = DateTime.MinValue;
 
     public TrayApplicationContext()
     {
@@ -257,6 +269,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (!_security.ValidateToken(fb.ClientId, fb.Token)) return;      // only the paired Mac may steer
         if (!source.Address.Equals(_sender.Target.Address)) return;
 
+        // The Mac sets this when it sees a frameId gap (a lost/dropped frame broke the
+        // P-frame reference chain). Sending an IDR now re-syncs it in ~1 RTT instead of
+        // leaving it frozen until the next periodic keyframe (up to a second).
+        if ((fb.Flags & FeedbackFlags.RequestKeyframe) != 0)
+            _encoder.RequestKeyFrame();
+
         double loss = fb.LossPermille / 1000.0;
 
         // Adaptive FEC: raise redundancy as loss climbs (responds every feedback, cheap).
@@ -270,16 +288,72 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _lastAdapt = now;
         int cur  = _adaptiveBitrate > 0 ? _adaptiveBitrate : _adaptiveMax;
         int next = cur;
-        if      (loss > 0.10)  next = (int)(cur * 0.6);   // heavy loss: back off hard
-        else if (loss > 0.03)  next = (int)(cur * 0.85);  // some loss: ease down
-        else if (loss < 0.015) next = cur + 1_000_000;    // clean: probe up (+1 Mbps)
+        if (loss > 0.10)                                  // heavy network loss: back off hard
+        {
+            next = (int)(cur * 0.6);
+            _softCeiling = Math.Max(AdaptiveMinBitrate, next);
+        }
+        else if (loss > 0.03)                             // some loss: ease down
+        {
+            next = (int)(cur * 0.85);
+            _softCeiling = Math.Max(AdaptiveMinBitrate, next);
+        }
+        else if (loss < 0.015)                            // clean link: maybe probe up
+        {
+            // Don't probe straight back to the hard max — that just re-saturates the link and
+            // causes the decode-error sawtooth. Wait until the link's been quiet for a bit
+            // after the last congestion, let the learned ceiling recover slowly (to re-test if
+            // the link improved), and climb gently toward it, never past it.
+            if ((now - _lastCongestion).TotalMilliseconds > 1500)
+            {
+                _softCeiling = Math.Min(_adaptiveMax, _softCeiling + 250_000);
+                next = Math.Min(cur + 500_000, _softCeiling);
+            }
+        }
 
         next = Math.Clamp(next, AdaptiveMinBitrate, _adaptiveMax);
         if (next == cur) return;
 
         _adaptiveBitrate = next;
         _encoder.SetBitrate(next);
-        UpdateStatus($"Adapting: {loss * 100:F0}% loss → {next / 1_000_000.0:F1} Mbps");
+        UpdateStatus($"Adapting: {loss * 100:F0}% loss → {next / 1_000_000.0:F1} Mbps (cap {_softCeiling / 1_000_000.0:F1})");
+    }
+
+    // Send-side congestion control. Called on the encoder pump thread with the send-queue
+    // depth just before each frame is enqueued. When the queue backs up, the Wi-Fi link
+    // cannot carry the current bitrate; DropOldest then discards a frame, tearing a frameId
+    // gap that makes every following P-frame fail to decode on the Mac (-12909) until a
+    // keyframe. The Mac reports 0% loss because the drop is local, so this is the only place
+    // that congestion is visible. Two responses: force a keyframe to heal the gap immediately
+    // (rather than waiting up to a second for the periodic one), and back the bitrate off so
+    // the send loop can catch up and stop dropping.
+    private void OnSendQueueDepth(int depth)
+    {
+        if (depth < SendQueueHighWater || _encoder is null || _adaptiveMax <= 0) return;
+
+        DateTime now = DateTime.UtcNow;
+        // Mark congestion so the loss path holds off probing back up for a while.
+        _lastCongestion = now;
+        // Heal the reference chain fast, but don't spam keyframes (each one is large and
+        // adds to the very congestion we're fighting).
+        if ((now - _lastSendPressureKeyframe).TotalMilliseconds >= 250)
+        {
+            _lastSendPressureKeyframe = now;
+            _encoder.RequestKeyFrame();
+        }
+
+        // Back off on the same cadence as the loss path so the two can't fight.
+        if ((now - _lastAdapt).TotalMilliseconds < 350) return;
+        _lastAdapt = now;
+        int cur  = _adaptiveBitrate > 0 ? _adaptiveBitrate : _adaptiveMax;
+        // Remember this rate overdrove the link, so the probe-up converges just below it
+        // instead of climbing back to the hard max and re-saturating (the error sawtooth).
+        _softCeiling = Math.Max(AdaptiveMinBitrate, (int)(cur * 0.9));
+        int next = Math.Clamp((int)(cur * 0.7), AdaptiveMinBitrate, _adaptiveMax);
+        if (next == cur) return;
+        _adaptiveBitrate = next;
+        _encoder.SetBitrate(next);
+        UpdateStatus($"Adapting: send queue {depth} → {next / 1_000_000.0:F1} Mbps (cap {_softCeiling / 1_000_000.0:F1})");
     }
 
     private static async Task SendHandshakeResponseAsync(
@@ -317,6 +391,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         // under loss (probing back up toward this ceiling when the link is clean).
         _adaptiveMax     = targetBitrate;
         _adaptiveBitrate = targetBitrate;
+        _softCeiling     = targetBitrate;   // starts optimistic; congestion pulls it toward real capacity
 
         // Wire encoder output → a send queue drained by a dedicated send loop.
         // FrameEncoded fires synchronously on the encoder's pump thread (inside
@@ -334,7 +409,14 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 SingleWriter = true,
             });
         uint frameId = 0;
-        _encoder.FrameEncoded += encoded => _sendChannel!.Writer.TryWrite((encoded, frameId++));
+        _encoder.FrameEncoded += encoded =>
+        {
+            // Watch the queue depth BEFORE enqueuing: a backlog means the link can't carry
+            // the current rate and frames are being dropped locally (a reference-chain gap
+            // on the Mac). React to that congestion the loss-based feedback can't see.
+            OnSendQueueDepth(_sendChannel!.Reader.Count);
+            _sendChannel!.Writer.TryWrite((encoded, frameId++));
+        };
         _sendTask = Task.Run(SendLoopAsync);
 
         _encoder.Initialize();

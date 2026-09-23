@@ -28,6 +28,8 @@ final class H264Decoder {
 
     private var session: VTDecompressionSession?
     private var formatDesc: CMVideoFormatDescription?
+    // HEVC parameter sets: VPS + SPS + PPS (H.264 had only SPS + PPS).
+    private var currentVPS: Data?
     private var currentSPS: Data?
     private var currentPPS: Data?
 
@@ -39,8 +41,25 @@ final class H264Decoder {
     private var pendingTraces: [Int64: FrameTrace] = [:]
     private var frameCounter: Int64 = 0
 
+    // Bytes of the previously submitted frame, for duplicate suppression. On a static
+    // desktop Windows re-emits the same image, and the encoder produces byte-identical
+    // skip-frames — which carry an identical HEVC picture-order-count (POC). Submitting
+    // two frames with the same POC makes VideoToolbox reject the second with
+    // kVTVideoDecoderBadDataErr (-12909). A byte-identical frame carries no new picture
+    // information, so dropping it is lossless and avoids the collision. Real motion always
+    // changes the POC, so genuine frames are never identical and never dropped.
+    private var lastFrameBytes: Data?
+
     func decode(nalData: Data, isIDR: Bool, trace: FrameTrace? = nil) {
         FrameTimingLog.shared.recordSubmit(isIDR: isIDR)
+        // Drop a frame byte-identical to the previous one (duplicate POC → -12909). See
+        // lastFrameBytes. This includes IDRs: Windows emits a duplicate keyframe on a
+        // static/blank desktop, and a second IDR with the same POC=0 poisons VideoToolbox's
+        // reference state so every following P-frame fails with -12909 until the next IDR.
+        // The first copy already built the session and decoded, so skipping the duplicate is
+        // lossless.
+        if let last = lastFrameBytes, last == nalData { return }
+        lastFrameBytes = nalData
         if isIDR {
             processIDRBuffer(nalData, trace: trace)
         } else {
@@ -61,48 +80,56 @@ final class H264Decoder {
 
     private func processIDRBuffer(_ data: Data, trace: FrameTrace?) {
         let nalus = splitAnnexB(data)
+        var vps: Data?
         var sps: Data?
         var pps: Data?
-        var idr: Data?
+        var hasVCL = false
 
         for nalu in nalus {
-            guard let first = nalu.first else { continue }
-            switch first & 0x1F {
-            case 7: sps = nalu
-            case 8: pps = nalu
-            case 5: idr = nalu
+            switch hevcNalType(nalu) {
+            case 32: vps = nalu
+            case 33: sps = nalu
+            case 34: pps = nalu
+            case 0...31: hasVCL = true    // slice NAL (IDR keyframe slices are types 19/20)
             default: break
             }
         }
 
-        if let sps, let pps, (currentSPS != sps || currentPPS != pps) {
+        if let vps, let sps, let pps, (currentVPS != vps || currentSPS != sps || currentPPS != pps) {
+            currentVPS = vps
             currentSPS = sps
             currentPPS = pps
-            rebuildSession(sps: sps, pps: pps)
+            rebuildSession(vps: vps, sps: sps, pps: pps)
         }
-        if let idr { decodeSample(idr, trace: trace) }
+        // Decode the keyframe's slices; toAVCC strips VPS/SPS/PPS/AUD, keeping every VCL
+        // slice — so multi-slice keyframes decode fully, not just the last slice.
+        if hasVCL { decodeSample(data, trace: trace) }
     }
 
-    private func rebuildSession(sps: Data, pps: Data) {
+    private func rebuildSession(vps: Data, sps: Data, pps: Data) {
         if let s = session { VTDecompressionSessionInvalidate(s) }
         session = nil
         formatDesc = nil
 
-        let status: OSStatus = sps.withUnsafeBytes { spsRaw in
-            pps.withUnsafeBytes { ppsRaw in
-                var ptrs: [UnsafePointer<UInt8>] = [
-                    spsRaw.bindMemory(to: UInt8.self).baseAddress!,
-                    ppsRaw.bindMemory(to: UInt8.self).baseAddress!
-                ]
-                var sizes = [sps.count, pps.count]
-                return CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                    allocator: nil,
-                    parameterSetCount: 2,
-                    parameterSetPointers: &ptrs,
-                    parameterSetSizes: &sizes,
-                    nalUnitHeaderLength: 4,
-                    formatDescriptionOut: &formatDesc
-                )
+        let status: OSStatus = vps.withUnsafeBytes { vpsRaw in
+            sps.withUnsafeBytes { spsRaw in
+                pps.withUnsafeBytes { ppsRaw in
+                    var ptrs: [UnsafePointer<UInt8>] = [
+                        vpsRaw.bindMemory(to: UInt8.self).baseAddress!,
+                        spsRaw.bindMemory(to: UInt8.self).baseAddress!,
+                        ppsRaw.bindMemory(to: UInt8.self).baseAddress!
+                    ]
+                    var sizes = [vps.count, sps.count, pps.count]
+                    return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                        allocator: nil,
+                        parameterSetCount: 3,
+                        parameterSetPointers: &ptrs,
+                        parameterSetSizes: &sizes,
+                        nalUnitHeaderLength: 4,
+                        extensions: nil,
+                        formatDescriptionOut: &formatDesc
+                    )
+                }
             }
         }
         guard status == noErr, let desc = formatDesc else { return }
@@ -192,10 +219,15 @@ final class H264Decoder {
             traceLock.unlock()
         }
 
+        // Give HEVC a real, monotonic DTS (== PTS, since the stream has no B-frames).
+        // With decodeTimeStamp: .invalid VideoToolbox has no decode-order timeline, which
+        // can make it reject inter frames (kVTVideoDecoderBadDataErr) even though the
+        // reference IDR decoded fine.
+        let ts = CMTime(value: token, timescale: 600)
         var timingInfo = CMSampleTimingInfo(
             duration: .invalid,
-            presentationTimeStamp: CMTime(value: token, timescale: 600),
-            decodeTimeStamp: .invalid
+            presentationTimeStamp: ts,
+            decodeTimeStamp: ts
         )
         var sampleBuf: CMSampleBuffer?
         CMSampleBufferCreateReady(
@@ -210,13 +242,16 @@ final class H264Decoder {
             sampleBufferOut: &sampleBuf
         )
         guard let sb = sampleBuf else { return }
-        // Asynchronous decompression lets the hardware decoder pipeline frames.
-        // A synchronous call (flags: []) blocks the decode queue for the full
-        // hardware round trip per frame, which showed up as a fixed ~2-frame
-        // (~33 ms) latency floor in the frame timing. Without
-        // ._EnableTemporalProcessing callbacks still fire in decode order.
+        // Synchronous decode. Bufferbloat delivers frames in clumps; feeding those to an
+        // ASYNCHRONOUS decoder back-to-back lets a P-frame reach the decoder before its
+        // reference frame's decode has finished, so the reference isn't in the DPB yet and
+        // the frame fails with kVTVideoDecoderBadDataErr (-12909) — which then cascades to
+        // every following P-frame until the next keyframe (the multi-second freezes). A
+        // synchronous call finishes each frame (and its reference) before the next is
+        // submitted, so a clumped burst can't scramble reference order. HEVC decode is ~2.4 ms
+        // here, well inside the 16 ms/frame budget at 60 fps.
         VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb,
-                                          flags: [._EnableAsynchronousDecompression],
+                                          flags: [],
                                           frameRefcon: nil, infoFlagsOut: nil)
     }
 
@@ -256,13 +291,21 @@ final class H264Decoder {
         let list  = nalus.isEmpty ? [data] : nalus
         var out = Data()
         for nal in list where !nal.isEmpty {
-            let type = (nal.first ?? 0) & 0x1F
-            if type == 9 { continue }   // drop AUD — VideoToolbox rejects it inside AVCC
+            let type = hevcNalType(nal)
+            // Drop parameter sets (they live in the format description) and the AUD;
+            // keep the VCL slice NALs. VideoToolbox rejects a sample that carries these.
+            if type == 32 || type == 33 || type == 34 || type == 35 { continue }
             var length = UInt32(nal.count).bigEndian
             out.append(Swift.withUnsafeBytes(of: &length) { Data($0) })
             out.append(nal)
         }
         return out
+    }
+
+    // HEVC NAL unit type = bits 1-6 of the first header byte (H.264 used bits 0-4).
+    private func hevcNalType(_ nal: Data) -> UInt8 {
+        guard let first = nal.first else { return 0xFF }
+        return (first >> 1) & 0x3F
     }
 
     private func makeBlockBuffer(_ data: Data) -> CMBlockBuffer? {

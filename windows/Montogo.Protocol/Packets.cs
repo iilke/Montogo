@@ -61,8 +61,13 @@ public struct FeedbackPacket
     public HandshakeToken Token; // 16 bytes; HMAC-SHA256(authKey, clientId)[0..15]
     public ushort LossPermille;  // 0..1000 packet loss over the last window
     public byte Fps;             // rendered fps (diagnostics)
-    public byte Reserved;
+    public byte Flags;           // bit 0 = request keyframe (Mac saw a frameId gap)
 }                                // total: 40 bytes
+
+public static class FeedbackFlags
+{
+    public const byte RequestKeyframe = 1 << 0;
+}
 
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct HandshakeRequestPacket

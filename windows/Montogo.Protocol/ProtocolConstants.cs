@@ -3,7 +3,7 @@ namespace Montogo.Protocol;
 public static class ProtocolConstants
 {
     public const ushort Magic          = 0x474D;
-    public const byte   CurrentVersion = 4; // v4: Reed–Solomon FEC (systematic, GF(256))
+    public const byte   CurrentVersion = 5; // v5: HEVC (H.265) video
 
     public const int VideoPort = 47921;
 

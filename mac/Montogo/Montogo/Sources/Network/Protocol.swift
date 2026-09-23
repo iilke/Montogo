@@ -4,7 +4,7 @@ import Foundation
 
 enum MontogoProtocol {
     static let magic: UInt16 = 0x474D
-    static let version: UInt8 = 4   // v4: Reed–Solomon FEC (systematic, GF(256))
+    static let version: UInt8 = 5   // v5: HEVC (H.265) video
     static let port: UInt16 = 47921
     static let maxChunkPayload = 1400
     static let gcmTagSize = 16
@@ -57,11 +57,13 @@ struct HeartbeatPacket {
 }
 
 // Mac → Windows link-quality report. Layout mirrors the C# FeedbackPacket (Pack=1):
-// magic(2) version(1) type(1) clientId(16) token(16) lossPermille(2) fps(1) reserved(1).
+// magic(2) version(1) type(1) clientId(16) token(16) lossPermille(2) fps(1) flags(1).
 struct FeedbackPacket {
     static let size = 40
+    static let flagRequestKeyframe: UInt8 = 1 << 0   // set when the Mac saw a frameId gap
 
-    static func build(clientId: UUID, authToken: Data, lossPermille: UInt16, fps: UInt8) -> Data {
+    static func build(clientId: UUID, authToken: Data, lossPermille: UInt16,
+                      fps: UInt8, flags: UInt8 = 0) -> Data {
         var pkt = Data(count: size)
         pkt.write(MontogoProtocol.magic, at: 0)
         pkt[2] = MontogoProtocol.version
@@ -71,7 +73,7 @@ struct FeedbackPacket {
         pkt.replaceSubrange(20..<36, with: authToken)
         pkt.write(lossPermille, at: 36)
         pkt[38] = fps
-        pkt[39] = 0
+        pkt[39] = flags
         return pkt
     }
 }

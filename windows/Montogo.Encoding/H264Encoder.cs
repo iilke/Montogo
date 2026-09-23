@@ -81,7 +81,7 @@ public sealed class H264Encoder : IDisposable
         var outType = new MFT_REGISTER_TYPE_INFO
         {
             guidMajorType = PInvoke.MFMediaType_Video,
-            guidSubtype   = PInvoke.MFVideoFormat_H264,
+            guidSubtype   = PInvoke.MFVideoFormat_HEVC,
         };
 
         PInvoke.MFTEnumEx(
@@ -156,13 +156,13 @@ public sealed class H264Encoder : IDisposable
                 try
                 {
                     PrepareMft(hwMft, hardware: true);
-                    Trace.WriteLine("[Montogo.Encoding] Using hardware H.264 encoder MFT");
+                    Trace.WriteLine("[Montogo.Encoding] Using hardware HEVC encoder MFT");
                     return (hwMft, IsHardware: true);
                 }
                 catch
                 {
                     // Config rejected (unsupported resolution, driver quirk…) — release
-                    // and fall through to software.
+                    // and fall through to the unsupported path below.
                     _eventGen = null;
                     _pendingNeedInput = 0;
                     Marshal.ReleaseComObject(hwMft);
@@ -171,12 +171,12 @@ public sealed class H264Encoder : IDisposable
         }
         catch { }
 
-        // Software fallback — guaranteed to exist on all supported Windows versions
-        Trace.WriteLine("[Montogo.Encoding] No hardware H.264 encoder found; falling back to Microsoft software MFT");
-        var softType = Type.GetTypeFromCLSID(SoftwareClsid, throwOnError: true)!;
-        var softMft  = (IMFTransform)Activator.CreateInstance(softType)!;
-        PrepareMft(softMft, hardware: false);
-        return (softMft, IsHardware: false);
+        // No software HEVC encoder ships with Windows (the SoftwareClsid MFT is H.264 only),
+        // so HEVC requires a GPU encoder. This branch trades the H.264 software fallback for
+        // HEVC's ~2x better compression; a machine without a hardware HEVC encoder can't run
+        // this build.
+        throw new NotSupportedException(
+            "No hardware HEVC encoder found. HEVC requires a GPU encoder (NVENC / Quick Sync / AMF).");
     }
 
     /// <summary>
@@ -254,10 +254,10 @@ public sealed class H264Encoder : IDisposable
 
     private void SetupTypesOn(IMFTransform mft, bool hardware)
     {
-        // Output (H.264) must be set before input (NV12) — MFT rejects the reverse order
+        // Output (HEVC) must be set before the input type — the MFT rejects the reverse order.
         PInvoke.MFCreateMediaType(out IMFMediaType outputType).ThrowOnFailure();
         outputType.SetGUID(PInvoke.MF_MT_MAJOR_TYPE, PInvoke.MFMediaType_Video);
-        outputType.SetGUID(PInvoke.MF_MT_SUBTYPE, PInvoke.MFVideoFormat_H264);
+        outputType.SetGUID(PInvoke.MF_MT_SUBTYPE, PInvoke.MFVideoFormat_HEVC);
         outputType.SetUINT64(PInvoke.MF_MT_FRAME_SIZE, PackRatio(_options.Width, _options.Height));
         outputType.SetUINT64(PInvoke.MF_MT_FRAME_RATE, PackRatio(_options.Fps, 1));
         outputType.SetUINT32(PInvoke.MF_MT_AVG_BITRATE, (uint)_options.BitrateBps);
