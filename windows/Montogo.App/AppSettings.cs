@@ -38,24 +38,34 @@ internal sealed class AppSettings
     /// </summary>
     public string GetOrCreateConnectionCode()
     {
-        if (SharedSecret is null)
+        // Recover a stored code only if it's still in the current 13-char format. A pre-v7
+        // 8-char code (or anything malformed) is discarded and a fresh secret generated —
+        // v7 lengthened the code from 40 to 64 bits, so old codes can't be reused.
+        if (SharedSecret is not null)
         {
-            string fresh = SecurityContext.EncodeConnectionCode(RandomNumberGenerator.GetBytes(5));
-            SharedSecret = Protect(fresh);
-            Save();
-            return fresh;
+            string? decrypted = TryUnprotect(SharedSecret);   // encrypted blob → plaintext, else null
+            if (decrypted is not null)
+            {
+                if (IsCurrentFormat(decrypted)) return decrypted;
+            }
+            else if (IsCurrentFormat(SharedSecret))
+            {
+                // Legacy plaintext code (pre-DPAPI) in the current format: migrate to encrypted.
+                string legacy = SharedSecret;
+                SharedSecret = Protect(legacy);
+                Save();
+                return legacy;
+            }
+            // else: pre-v7 short code or corrupt → fall through and regenerate.
         }
 
-        // Encrypted value → decrypt. If that fails, this is a legacy plaintext code
-        // (pre-DPAPI): migrate it to the encrypted form and rewrite the file.
-        string? decrypted = TryUnprotect(SharedSecret);
-        if (decrypted is not null) return decrypted;
-
-        string legacyPlaintext = SharedSecret;
-        SharedSecret = Protect(legacyPlaintext);
+        string fresh = SecurityContext.EncodeConnectionCode(RandomNumberGenerator.GetBytes(8));
+        SharedSecret = Protect(fresh);
         Save();
-        return legacyPlaintext;
+        return fresh;
     }
+
+    private static bool IsCurrentFormat(string code) => code.Replace("-", "").Length == 13;
 
     /// <summary>Encrypts and persists a replacement connection code (tray "Reset").</summary>
     public void SetConnectionCode(string code)

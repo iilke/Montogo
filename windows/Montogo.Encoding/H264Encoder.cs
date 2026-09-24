@@ -17,21 +17,14 @@ public sealed class H264Encoder : IDisposable
     private const uint METransformHaveOutput = 602;
     private const uint MF_EVENT_FLAG_NO_WAIT = 1;
 
-    // Microsoft H.264 Video Encoder MFT (software, always available on Win 7+)
-    private static readonly Guid SoftwareClsid = new("6CA50344-051A-4DED-9779-A43305165E35");
-
     private readonly EncoderOptions _options;
     private IMFTransform? _encoder;
-    private byte[]? _nv12;
     private long _frameDurationHns;
     private bool _started;
-    // Hardware NVENC advertises ARGB32 input, so we hand it the DXGI BGRA bytes straight
-    // and let the GPU do the colour conversion — dropping the crude CPU BgraToNv12 step.
-    // The software fallback MFT only takes NV12, so it keeps the CPU conversion.
-    private bool _argbInput;
 
-    // Software MFTs require caller-allocated output samples; the sample and its
-    // buffer are created once in Initialize and reused for every ProcessOutput.
+    // Set for an MFT that does not advertise MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, so we must
+    // supply a reusable output sample. Hardware HEVC MFTs provide their own, so this stays null
+    // for NVENC/Quick Sync/AMF; kept as a defensive fallback for any that don't.
     private IMFSample? _reusableOutputSample;
 
     // Non-null when the active encoder is an async MFT (all hardware encoders are).
@@ -121,9 +114,8 @@ public sealed class H264Encoder : IDisposable
 
         (_encoder, IsHardwareAccelerated) = CreateEncoder();
 
-        // Hardware MFTs advertise MFT_OUTPUT_STREAM_PROVIDES_SAMPLES and allocate
-        // their own output samples (pSample = null).  The Microsoft software H.264
-        // MFT does not — it returns E_INVALIDARG unless the caller supplies one.
+        // Hardware MFTs advertise MFT_OUTPUT_STREAM_PROVIDES_SAMPLES and allocate their own
+        // output samples (pSample = null). Supply one only for an MFT that doesn't.
         _encoder.GetOutputStreamInfo(0, out MFT_OUTPUT_STREAM_INFO streamInfo);
         const uint MFT_OUTPUT_STREAM_PROVIDES_SAMPLES = 0x100;
         if ((streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0)
@@ -140,7 +132,6 @@ public sealed class H264Encoder : IDisposable
         _encoder.ProcessMessage(MFT_MESSAGE_TYPE.MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         _encoder.ProcessMessage(MFT_MESSAGE_TYPE.MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
-        _nv12 = new byte[_options.Width * _options.Height * 3 / 2];
         _frameDurationHns = 10_000_000L / _options.Fps;
         _started = true;
     }
@@ -155,7 +146,7 @@ public sealed class H264Encoder : IDisposable
             {
                 try
                 {
-                    PrepareMft(hwMft, hardware: true);
+                    PrepareMft(hwMft);
                     Trace.WriteLine("[Montogo.Encoding] Using hardware HEVC encoder MFT");
                     return (hwMft, IsHardware: true);
                 }
@@ -171,10 +162,8 @@ public sealed class H264Encoder : IDisposable
         }
         catch { }
 
-        // No software HEVC encoder ships with Windows (the SoftwareClsid MFT is H.264 only),
-        // so HEVC requires a GPU encoder. This branch trades the H.264 software fallback for
-        // HEVC's ~2x better compression; a machine without a hardware HEVC encoder can't run
-        // this build.
+        // No software HEVC encoder ships with Windows, so HEVC requires a GPU encoder — the
+        // trade for HEVC's ~2x better compression. A machine without one can't run this build.
         throw new NotSupportedException(
             "No hardware HEVC encoder found. HEVC requires a GPU encoder (NVENC / Quick Sync / AMF).");
     }
@@ -183,7 +172,7 @@ public sealed class H264Encoder : IDisposable
     /// Unlocks async MFTs, applies low-latency codec settings, and negotiates types.
     /// Order matters: an async MFT rejects most IMFTransform calls until unlocked.
     /// </summary>
-    private void PrepareMft(IMFTransform mft, bool hardware)
+    private void PrepareMft(IMFTransform mft)
     {
         mft.GetAttributes(out IMFAttributes attrs);
         uint isAsync = 0;
@@ -197,7 +186,7 @@ public sealed class H264Encoder : IDisposable
 
         // Rate-control settings must be applied AFTER the output type is set —
         // SetOutputType otherwise resets them, so an earlier CBR request is lost.
-        SetupTypesOn(mft, hardware);
+        SetupTypesOn(mft);
         TryConfigureCodec(mft);
     }
 
@@ -252,7 +241,7 @@ public sealed class H264Encoder : IDisposable
     /// </summary>
     public void SetBitrate(int bitsPerSecond) => Interlocked.Exchange(ref _pendingBitrate, bitsPerSecond);
 
-    private void SetupTypesOn(IMFTransform mft, bool hardware)
+    private void SetupTypesOn(IMFTransform mft)
     {
         // Output (HEVC) must be set before the input type — the MFT rejects the reverse order.
         PInvoke.MFCreateMediaType(out IMFMediaType outputType).ThrowOnFailure();
@@ -263,31 +252,23 @@ public sealed class H264Encoder : IDisposable
         outputType.SetUINT32(PInvoke.MF_MT_AVG_BITRATE, (uint)_options.BitrateBps);
         outputType.SetUINT32(PInvoke.MF_MT_INTERLACE_MODE, 2); // MFVideoInterlaceMode_Progressive
         outputType.SetUINT64(PInvoke.MF_MT_PIXEL_ASPECT_RATIO, PackRatio(1, 1));
-        // Long keyframe interval. The NVENC MFT ignores this (it always emits ~1
-        // keyframe/sec), but the Microsoft software fallback honours it — fewer
-        // keyframes there means fewer ~200-packet bursts. A keyframe is forced on
-        // connect (RequestKeyFrame) for fast startup regardless of the interval.
+        // Long keyframe interval. The NVENC MFT ignores it (it always emits ~1 keyframe/sec)
+        // and a keyframe is forced on connect (RequestKeyFrame) for fast startup regardless.
         outputType.SetUINT32(PInvoke.MF_MT_MAX_KEYFRAME_SPACING, (uint)(_options.Fps * 4));
         mft.SetOutputType(0, outputType, 0);
 
-        // Hardware NVENC accepts ARGB32 (our DXGI BGRA) and converts on the GPU; the
-        // software MFT only takes NV12. _argbInput records which, so SubmitFrame feeds the
-        // matching bytes.
-        _argbInput = hardware;
-        Guid inputSubtype = hardware
-            ? new Guid("00000015-0000-0010-8000-00aa00389b71")   // MFVideoFormat_ARGB32
-            : PInvoke.MFVideoFormat_NV12;
-
+        // Hardware NVENC accepts ARGB32 (our DXGI BGRA) directly and converts on the GPU, so
+        // SubmitFrame hands it the raw DXGI bytes with no CPU colour conversion.
+        var argb32 = new Guid("00000015-0000-0010-8000-00aa00389b71"); // MFVideoFormat_ARGB32
         PInvoke.MFCreateMediaType(out IMFMediaType inputType).ThrowOnFailure();
         inputType.SetGUID(PInvoke.MF_MT_MAJOR_TYPE, PInvoke.MFMediaType_Video);
-        inputType.SetGUID(PInvoke.MF_MT_SUBTYPE, inputSubtype);
+        inputType.SetGUID(PInvoke.MF_MT_SUBTYPE, argb32);
         inputType.SetUINT64(PInvoke.MF_MT_FRAME_SIZE, PackRatio(_options.Width, _options.Height));
         inputType.SetUINT64(PInvoke.MF_MT_FRAME_RATE, PackRatio(_options.Fps, 1));
         inputType.SetUINT32(PInvoke.MF_MT_INTERLACE_MODE, 2);
         inputType.SetUINT64(PInvoke.MF_MT_PIXEL_ASPECT_RATIO, PackRatio(1, 1));
         // ARGB32 needs an explicit stride; positive = top-down, matching DXGI's row order.
-        if (hardware)
-            inputType.SetUINT32(PInvoke.MF_MT_DEFAULT_STRIDE, (uint)(_options.Width * 4));
+        inputType.SetUINT32(PInvoke.MF_MT_DEFAULT_STRIDE, (uint)(_options.Width * 4));
         mft.SetInputType(0, inputType, 0);
     }
 
@@ -319,18 +300,8 @@ public sealed class H264Encoder : IDisposable
             catch { }
         }
 
-        // Hardware path: hand the encoder the raw BGRA and let the GPU convert. Software
-        // path: convert to NV12 on the CPU first.
-        ReadOnlySpan<byte> src;
-        if (_argbInput)
-        {
-            src = bgraData;
-        }
-        else
-        {
-            BgraToNv12(bgraData, _nv12!, _options.Width, _options.Height);
-            src = _nv12;
-        }
+        // Hand the encoder the raw DXGI BGRA (ARGB32 input); the GPU does the colour convert.
+        ReadOnlySpan<byte> src = bgraData;
 
         uint size = (uint)src.Length;
         PInvoke.MFCreateMemoryBuffer(size, out IMFMediaBuffer buffer).ThrowOnFailure();
@@ -419,58 +390,6 @@ public sealed class H264Encoder : IDisposable
     }
 
     // ── Color conversion ─────────────────────────────────────────────────────
-
-    // BT.601 limited range, integer approximation.
-    // UV sampled from top-left pixel of each 2×2 block.
-    // Unsafe pointers + Parallel.For over row pairs: the scalar managed version took
-    // tens of ms per 1080p frame, which alone dropped the stream below target fps.
-    private static unsafe void BgraToNv12(ReadOnlySpan<byte> bgra, byte[] nv12, int width, int height)
-    {
-        fixed (byte* bgraPtr = bgra)
-        fixed (byte* nv12Ptr = nv12)
-        {
-            // Lambdas cannot capture pointers, so smuggle them through as nint.
-            nint srcAddr = (nint)bgraPtr;
-            nint dstAddr = (nint)nv12Ptr;
-            int  w = width;
-
-            Parallel.For(0, height / 2, rowPair =>
-            {
-                int row0 = rowPair * 2;
-                byte* s0 = (byte*)srcAddr + (long)row0 * w * 4;
-                byte* s1 = s0 + w * 4;
-                byte* y0 = (byte*)dstAddr + (long)row0 * w;
-                byte* y1 = y0 + w;
-                byte* uv = (byte*)dstAddr + (long)w * (height + rowPair);
-
-                for (int col = 0; col < w; col += 2)
-                {
-                    int b00 = s0[0], g00 = s0[1], r00 = s0[2];
-                    int b01 = s0[4], g01 = s0[5], r01 = s0[6];
-                    int b10 = s1[0], g10 = s1[1], r10 = s1[2];
-                    int b11 = s1[4], g11 = s1[5], r11 = s1[6];
-
-                    y0[0] = (byte)(((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16);
-                    y0[1] = (byte)(((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16);
-                    y1[0] = (byte)(((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16);
-                    y1[1] = (byte)(((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16);
-
-                    // Average the 2×2 block's colour for chroma (proper 4:2:0 box downsampling).
-                    // Point-sampling only the top-left pixel aliased fine detail into coloured
-                    // speckle on edges; the average removes that at zero decode-side cost.
-                    int rA = (r00 + r01 + r10 + r11 + 2) >> 2;
-                    int gA = (g00 + g01 + g10 + g11 + 2) >> 2;
-                    int bA = (b00 + b01 + b10 + b11 + 2) >> 2;
-                    int u = ((-38 * rA - 74 * gA + 112 * bA + 128) >> 8) + 128;
-                    int v = ((112 * rA - 94 * gA -  18 * bA + 128) >> 8) + 128;
-                    uv[0] = (byte)Math.Clamp(u, 0, 255);
-                    uv[1] = (byte)Math.Clamp(v, 0, 255);
-
-                    s0 += 8; s1 += 8; y0 += 2; y1 += 2; uv += 2;
-                }
-            });
-        }
-    }
 
     // ── Dispose ──────────────────────────────────────────────────────────────
 

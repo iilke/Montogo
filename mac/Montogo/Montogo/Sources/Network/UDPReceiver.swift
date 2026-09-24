@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import QuartzCore
+import CryptoKit
 
 enum ConnectionState: Equatable {
     case idle
@@ -13,10 +14,17 @@ enum ConnectionState: Equatable {
 // All traffic (HandshakeResponse + video from any Windows source port) arrives
 // on the same socket, so there is no NWListener / NWConnection split.
 actor UDPReceiver {
-    private let keys: DerivedKeys
+    private let authKey: SymmetricKey
     private let clientId: UUID
-    private let authToken: Data
-    private var decryptor: StreamDecryptor
+    // nil until the handshake completes: the content key is established per session by ECDH,
+    // not derived from the code, so there is no decryptor before the response arrives.
+    private var decryptor: StreamDecryptor?
+    // Ephemeral P-256 key for this handshake cycle; regenerated each beginHandshaking().
+    private var ephemeralKey: P256.KeyAgreement.PrivateKey?
+    // Per-session feedback authentication key (from the ECDH secret) + a monotonic counter,
+    // so Windows can reject forged/replayed feedback. Set on a successful handshake.
+    private var feedbackKey: SymmetricKey?
+    private var feedbackCounter: UInt32 = 0
     private let assembler = FrameAssembler()
 
     private var fd: Int32 = -1
@@ -50,10 +58,8 @@ actor UDPReceiver {
     var onFrame: ((UInt32, Data, Bool, FrameTrace) -> Void)?
 
     init(keys: DerivedKeys) {
-        self.keys = keys
+        self.authKey = keys.authKey
         self.clientId = UUID()
-        self.authToken = AuthToken.make(authKey: keys.authKey, clientId: clientId)
-        self.decryptor = StreamDecryptor(encKey: keys.encKey)
     }
 
     func configure(
@@ -177,9 +183,14 @@ actor UDPReceiver {
 
     private func beginHandshaking() {
         onStateChange?(.connecting)
+        // Fresh ephemeral key for this handshake cycle, reused across retries so any response
+        // Windows sends matches. A reconnect (watchdog) makes a new one → a new session key.
+        let ephemeral = P256.KeyAgreement.PrivateKey()
+        ephemeralKey = ephemeral
+        let macPub = ephemeral.publicKey.x963Representation   // 65 bytes
         handshakeTimer = Task {
             while !Task.isCancelled {
-                let pkt = HandshakeRequestPacket.build(clientId: clientId, authToken: authToken)
+                let pkt = HandshakeRequestPacket.build(clientId: clientId, macPubKey: macPub, authKey: authKey)
                 send(pkt)
                 try? await Task.sleep(nanoseconds: UInt64(MontogoProtocol.handshakeRetryInterval * 1_000_000_000))
             }
@@ -187,12 +198,26 @@ actor UDPReceiver {
     }
 
     private func handleHandshakeResponse(_ data: Data) {
-        guard let resp = HandshakeResponse.parse(data),
-              resp.clientId == clientId
+        guard let ephemeral = ephemeralKey else { return }
+        // Authenticate the response with the code-derived authKey — the tag binds our own
+        // request's public key too (full transcript) — and confirm it echoes our clientId.
+        let ourMacPub = ephemeral.publicKey.x963Representation
+        guard let resp = HandshakeResponse.parse(data, authKey: authKey,
+                                                 expectedClientId: clientId, macPubKey: ourMacPub),
+              let winPub = try? P256.KeyAgreement.PublicKey(x963Representation: resp.winPubKey),
+              let shared = try? ephemeral.sharedSecretFromKeyAgreement(with: winPub)
         else { return }
+
+        // Derive this session's keys from the ECDH shared secret (forward secrecy): the video
+        // decryption key and the feedback-authentication key.
+        var dec = StreamDecryptor(encKey: DerivedKeys.sessionKey(from: shared))
+        dec.setNoncePrefix(resp.noncePrefix)
+        decryptor = dec
+        feedbackKey = DerivedKeys.feedbackKey(from: shared)
+        feedbackCounter = 0
+
         handshakeTimer?.cancel()
         handshakeTimer = nil
-        decryptor.setNoncePrefix(resp.noncePrefix)
         // Fresh session: discard any stale frame-ordering state and wait for the keyframe
         // Windows forces on (re)connect before decoding P-frames.
         expectedFrameId = nil
@@ -226,8 +251,12 @@ actor UDPReceiver {
         let payloadStart = VideoChunkHeader.size
         let payloadEnd   = payloadStart + Int(header.payloadLength)
         guard data.count >= payloadEnd else { return }
+        guard let decryptor else { return }   // no session key until the handshake completes
         let payload = Data(data[payloadStart..<payloadEnd])
-        let plaintext = decryptor.decrypt(payload: payload, sequenceNum: header.sequenceNum)
+        // Authenticate the wire header (bytes 0..<28) as GCM AAD — must match exactly what the
+        // sender authenticated, so a tampered routing/reassembly field fails the tag.
+        let aad = Data(data[0..<VideoChunkHeader.size])
+        let plaintext = decryptor.decrypt(payload: payload, sequenceNum: header.sequenceNum, aad: aad)
         // Count every arriving chunk by its continuous SequenceNum so gaps = packet loss.
         FrameTimingLog.shared.recordChunk(seq: header.sequenceNum, decrypted: plaintext != nil)
         // Same accounting over the shorter feedback window that drives adaptive bitrate.
@@ -273,15 +302,24 @@ actor UDPReceiver {
         }
     }
 
+    // Builds + sends one authenticated feedback packet (monotonic counter, HMAC with the
+    // per-session feedback key). No-op until the handshake has established the key. Actor
+    // isolation keeps the counter strictly increasing.
+    private func sendFeedback(lossPermille: UInt16, flags: UInt8) {
+        guard let feedbackKey else { return }
+        feedbackCounter &+= 1
+        send(FeedbackPacket.build(clientId: clientId, counter: feedbackCounter,
+                                  lossPermille: lossPermille, fps: 0, flags: flags,
+                                  feedbackKey: feedbackKey))
+    }
+
     // Sends an out-of-band feedback packet flagged to request an immediate keyframe. Rate-
     // limited; the periodic feedback also carries the flag while awaitingKeyframe is set.
     private func requestKeyframeNow() {
         let now = Date()
         guard now.timeIntervalSince(lastKeyframeRequest) >= 0.1 else { return }
         lastKeyframeRequest = now
-        send(FeedbackPacket.build(clientId: clientId, authToken: authToken,
-                                  lossPermille: 0, fps: 0,
-                                  flags: FeedbackPacket.flagRequestKeyframe))
+        sendFeedback(lossPermille: 0, flags: FeedbackPacket.flagRequestKeyframe)
     }
 
     // MARK: - Heartbeat
@@ -319,9 +357,7 @@ actor UDPReceiver {
                 // Keep asking for a keyframe until the chain is healed, in case the out-of-band
                 // request was itself lost.
                 let flags: UInt8 = awaitingKeyframe ? FeedbackPacket.flagRequestKeyframe : 0
-                let pkt = FeedbackPacket.build(clientId: clientId, authToken: authToken,
-                                               lossPermille: permille, fps: 0, flags: flags)
-                send(pkt)
+                sendFeedback(lossPermille: permille, flags: flags)
             }
         }
     }

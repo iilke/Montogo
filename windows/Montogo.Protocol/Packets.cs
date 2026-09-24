@@ -23,75 +23,61 @@ public struct VideoChunkHeader
                                  // its stripe g = ChunkIndex - ChunkTotal.
 }
 
-/// <summary>
-/// 16-byte HMAC-SHA256 token sent in HandshakeRequest.
-/// Token = HMAC-SHA256(authKey, clientId_bytes)[0..15]
-/// Stored as two little-endian uint64 fields — matches the LE byte order used by
-/// MemoryMarshal.Read on both Windows (x86-64) and Mac (ARM).
-/// </summary>
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
-public struct HandshakeToken
+// Mac → Windows link-quality report (v8), sent a few times per second. Authenticated with a
+// per-session key derived from the ECDH shared secret (HKDF info "montogo-feedback-v8") plus a
+// monotonic counter, so it can be neither forged nor replayed by a LAN attacker who sniffs one.
+// Layout, 60 bytes:
+//   [0]magic(2) [2]ver(1) [3]type=0x13(1) [4]clientId(16) [20]counter(4) [24]lossPermille(2)
+//   [26]fps(1) [27]flags(1) [28]authTag(32) = HMAC-SHA256(FeedbackKey, bytes[0..28])
+public static class FeedbackLayout
 {
-    public ulong Part0; // bytes  0–7 of the truncated HMAC
-    public ulong Part1; // bytes 8–15 of the truncated HMAC
+    public const int ClientId     = 4;
+    public const int Counter      = 20;
+    public const int LossPermille = 24;
+    public const int Fps          = 26;
+    public const int Flags        = 27;
+    public const int Signed       = 28;   // bytes covered by the HMAC
+    public const int AuthTag      = Signed;
+    public const int Size         = Signed + 32;   // 60
 }
-
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
-public struct HeartbeatPacket
-{
-    public ushort Magic;
-    public byte Version;
-    public byte PacketType;      // 0x10
-    public ulong TimestampUs;
-    public uint SequenceNum;
-}
-
-/// <summary>
-/// Mac → Windows link-quality report, sent a few times per second. Authenticated with
-/// the same ClientId + HMAC token as the handshake so only the paired Mac can steer the
-/// encoder. LossPermille is packet loss over the last interval in 0…1000 (‰).
-/// </summary>
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
-public struct FeedbackPacket
-{
-    public ushort Magic;
-    public byte Version;
-    public byte PacketType;      // 0x13
-    public Guid ClientId;        // 16 bytes
-    public HandshakeToken Token; // 16 bytes; HMAC-SHA256(authKey, clientId)[0..15]
-    public ushort LossPermille;  // 0..1000 packet loss over the last window
-    public byte Fps;             // rendered fps (diagnostics)
-    public byte Flags;           // bit 0 = request keyframe (Mac saw a frameId gap)
-}                                // total: 40 bytes
 
 public static class FeedbackFlags
 {
     public const byte RequestKeyframe = 1 << 0;
 }
 
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
-public struct HandshakeRequestPacket
+// Handshake wire layouts (v7). The 65-byte ephemeral P-256 public keys (X9.63:
+// 0x04 || X(32) || Y(32)) make fixed structs awkward, so these are parsed/built by offset.
+// Both messages end with a 32-byte HMAC-SHA256(authKey, all-preceding-bytes) that
+// authenticates the whole message and binds the ephemeral key to the pairing secret.
+//
+// HandshakeRequest (Mac → Windows), 117 bytes:
+//   [0]magic(2) [2]ver(1) [3]type=0x11(1) [4]clientId(16) [20]macPubKey(65) [85]authTag(32)
+//
+// HandshakeResponse (Windows → Mac), 131 bytes:
+//   [0]magic(2) [2]ver(1) [3]type=0x12(1) [4]width(2) [6]height(2) [8]fps(1) [9]reserved(1)
+//   [10]clientId(16) [26]winPubKey(65) [91]noncePrefix(8) [99]authTag(32)
+public static class HandshakeLayout
 {
-    public ushort Magic;
-    public byte Version;
-    public byte PacketType;      // 0x11
-    public ushort ProtoVersion;
-    public ushort Reserved;
-    public Guid ClientId;        // 16 bytes; random UUID per session
-    public HandshakeToken Token; // 16 bytes; HMAC-SHA256(authKey, clientId)[0..15]
-}                                // total: 40 bytes
+    public const int PubKeyLen  = 65;   // P-256 X9.63 uncompressed point
+    public const int AuthTagLen = 32;   // HMAC-SHA256
 
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
-public struct HandshakeResponsePacket
-{
-    public ushort Magic;
-    public byte Version;
-    public byte PacketType;          // 0x12
-    public ushort NegotiatedVersion;
-    public ushort DisplayWidth;
-    public ushort DisplayHeight;
-    public byte TargetFps;
-    public byte Reserved;
-    public Guid ClientId;            // echo of request ClientId; 16 bytes
-    public ulong NoncePrefix;        // UdpSender's per-session 8-byte GCM nonce prefix (LE)
-}                                    // total: 36 bytes
+    // Request
+    public const int ReqClientId  = 4;
+    public const int ReqPubKey    = 20;
+    public const int ReqSigned    = ReqPubKey + PubKeyLen;   // 85 bytes are HMAC-covered
+    public const int ReqAuthTag   = ReqSigned;               // tag follows the signed region
+    public const int ReqSize      = ReqSigned + AuthTagLen;  // 117
+
+    // Response
+    public const int RespWidth      = 4;
+    public const int RespHeight     = 6;
+    public const int RespFps        = 8;
+    public const int RespReserved   = 9;
+    public const int RespClientId   = 10;
+    public const int RespPubKey     = 26;
+    public const int RespNoncePrefix = RespPubKey + PubKeyLen; // 91
+    public const int RespSigned     = RespNoncePrefix + 8;     // 99 bytes are HMAC-covered
+    public const int RespAuthTag    = RespSigned;
+    public const int RespSize       = RespSigned + AuthTagLen; // 131
+}

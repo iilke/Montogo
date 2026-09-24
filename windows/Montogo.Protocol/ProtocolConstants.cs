@@ -3,7 +3,7 @@ namespace Montogo.Protocol;
 public static class ProtocolConstants
 {
     public const ushort Magic          = 0x474D;
-    public const byte   CurrentVersion = 5; // v5: HEVC (H.265) video
+    public const byte   CurrentVersion = 9; // v9: response HMAC binds macPubKey (full-transcript auth) (v8: authenticated feedback)
 
     public const int VideoPort = 47921;
 

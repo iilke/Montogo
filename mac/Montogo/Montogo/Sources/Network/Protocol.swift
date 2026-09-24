@@ -1,10 +1,11 @@
 import Foundation
+import CryptoKit
 
 // MARK: - Constants
 
 enum MontogoProtocol {
     static let magic: UInt16 = 0x474D
-    static let version: UInt8 = 5   // v5: HEVC (H.265) video
+    static let version: UInt8 = 9   // v9: response HMAC binds macPubKey (full-transcript auth) (v8: authenticated feedback)
     static let port: UInt16 = 47921
     static let maxChunkPayload = 1400
     static let gcmTagSize = 16
@@ -24,19 +25,25 @@ enum PacketType: UInt8 {
 
 // MARK: - Packet builders
 
+// v7 layout: magic(2) ver(1) type(1) clientId(16) macPubKey(65) authTag(32) = 117 bytes.
+// authTag = HMAC-SHA256(authKey, bytes[0..85]) authenticates the request and binds the
+// ephemeral public key to the pairing secret.
 struct HandshakeRequestPacket {
-    static let size = 40
+    static let size = 117
+    static let pubKeyOffset = 20
+    static let signedLen = 85   // bytes covered by the HMAC
 
-    static func build(clientId: UUID, authToken: Data) -> Data {
+    static func build(clientId: UUID, macPubKey: Data, authKey: SymmetricKey) -> Data {
+        precondition(macPubKey.count == 65)
         var pkt = Data(count: size)
         pkt.write(MontogoProtocol.magic, at: 0)
         pkt[2] = MontogoProtocol.version
         pkt[3] = PacketType.handshakeRequest.rawValue
-        pkt.write(UInt16(2), at: 4)     // ProtoVersion
-        pkt.write(UInt16(0), at: 6)     // Reserved
         var uuidBytes = clientId.uuid
-        Swift.withUnsafeBytes(of: &uuidBytes) { buf in pkt.replaceSubrange(8..<24, with: buf) }
-        pkt.replaceSubrange(24..<40, with: authToken)
+        Swift.withUnsafeBytes(of: &uuidBytes) { buf in pkt.replaceSubrange(4..<20, with: buf) }
+        pkt.replaceSubrange(20..<85, with: macPubKey)
+        let tag = HMAC<SHA256>.authenticationCode(for: Data(pkt[0..<signedLen]), using: authKey)
+        pkt.replaceSubrange(85..<117, with: Data(tag))
         return pkt
     }
 }
@@ -56,58 +63,79 @@ struct HeartbeatPacket {
     }
 }
 
-// Mac → Windows link-quality report. Layout mirrors the C# FeedbackPacket (Pack=1):
-// magic(2) version(1) type(1) clientId(16) token(16) lossPermille(2) fps(1) flags(1).
+// Mac → Windows link-quality report (v8). Authenticated with the per-session feedback key
+// (HKDF of the ECDH shared secret) + a monotonic counter, so it can't be forged or replayed.
+// Layout: magic(2) ver(1) type(1) clientId(16) counter(4) lossPermille(2) fps(1) flags(1)
+//         authTag(32) = HMAC-SHA256(feedbackKey, bytes[0..28]) = 60 bytes.
 struct FeedbackPacket {
-    static let size = 40
+    static let size = 60
+    static let signedLen = 28
     static let flagRequestKeyframe: UInt8 = 1 << 0   // set when the Mac saw a frameId gap
 
-    static func build(clientId: UUID, authToken: Data, lossPermille: UInt16,
-                      fps: UInt8, flags: UInt8 = 0) -> Data {
+    static func build(clientId: UUID, counter: UInt32, lossPermille: UInt16,
+                      fps: UInt8, flags: UInt8, feedbackKey: SymmetricKey) -> Data {
         var pkt = Data(count: size)
         pkt.write(MontogoProtocol.magic, at: 0)
         pkt[2] = MontogoProtocol.version
         pkt[3] = PacketType.feedback.rawValue
         var uuidBytes = clientId.uuid
         Swift.withUnsafeBytes(of: &uuidBytes) { buf in pkt.replaceSubrange(4..<20, with: buf) }
-        pkt.replaceSubrange(20..<36, with: authToken)
-        pkt.write(lossPermille, at: 36)
-        pkt[38] = fps
-        pkt[39] = flags
+        pkt.write(counter, at: 20)
+        pkt.write(lossPermille, at: 24)
+        pkt[26] = fps
+        pkt[27] = flags
+        let tag = HMAC<SHA256>.authenticationCode(for: Data(pkt[0..<signedLen]), using: feedbackKey)
+        pkt.replaceSubrange(28..<60, with: Data(tag))
         return pkt
     }
 }
 
 // MARK: - Parsed incoming packets
 
+// v9 layout: magic(2) ver(1) type(1) width(2) height(2) fps(1) reserved(1) clientId(16)
+// winPubKey(65) noncePrefix(8) authTag(32) = 131 bytes. authTag = HMAC(authKey, bytes[0..99] ‖
+// macPubKey) — binds the full exchange transcript (both ephemeral keys), closing the
+// spoofed-response vector and pinning the response to our request.
 struct HandshakeResponse {
-    let negotiatedVersion: UInt16
     let displayWidth: UInt16
     let displayHeight: UInt16
     let targetFps: UInt8
     let clientId: UUID
+    let winPubKey: Data         // 65-byte P-256 X9.63 public key
     let noncePrefix: UInt64     // 8-byte LE nonce prefix for AES-GCM
 
-    static func parse(_ data: Data) -> HandshakeResponse? {
-        guard data.count >= 36,
+    static let size = 131
+    static let signedLen = 99   // response bytes covered by the HMAC (macPubKey is appended)
+
+    static func parse(_ data: Data, authKey: SymmetricKey, expectedClientId: UUID, macPubKey: Data) -> HandshakeResponse? {
+        guard data.count >= size,
               data.read(UInt16.self, at: 0) == MontogoProtocol.magic,
               data[2] == MontogoProtocol.version,
               data[3] == PacketType.handshakeResponse.rawValue
         else { return nil }
-        let ver    = data.read(UInt16.self, at: 4)
-        let width  = data.read(UInt16.self, at: 6)
-        let height = data.read(UInt16.self, at: 8)
-        let fps    = data[10]
-        let cidData = data[12..<28]
+
+        // Authenticate the whole response — plus our own request's macPubKey — before trusting
+        // any field. Must match the Windows side: HMAC over response[0..99] followed by macPubKey.
+        var signed = Data(data[0..<signedLen])
+        signed.append(macPubKey)
+        let tag = Data(data[signedLen..<size])
+        guard HMAC<SHA256>.isValidAuthenticationCode(tag, authenticating: signed, using: authKey)
+        else { return nil }
+
+        let width  = data.read(UInt16.self, at: 4)
+        let height = data.read(UInt16.self, at: 6)
+        let fps    = data[8]
+        let cidData = data[10..<26]
         var raw = uuid_t(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
         cidData.withUnsafeBytes { buf in
             Swift.withUnsafeMutableBytes(of: &raw) { dst in dst.copyMemory(from: buf) }
         }
         let cid = UUID(uuid: raw)
-        let prefix = data.read(UInt64.self, at: 28)
-        return HandshakeResponse(negotiatedVersion: ver, displayWidth: width,
-                                 displayHeight: height, targetFps: fps,
-                                 clientId: cid, noncePrefix: prefix)
+        guard cid == expectedClientId else { return nil }
+        let winPub = Data(data[26..<91])
+        let prefix = data.read(UInt64.self, at: 91)
+        return HandshakeResponse(displayWidth: width, displayHeight: height, targetFps: fps,
+                                 clientId: cid, winPubKey: winPub, noncePrefix: prefix)
     }
 }
 

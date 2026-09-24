@@ -41,7 +41,7 @@ struct SetupView: View {
                             Label("Connection Code", systemImage: "key.fill")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            TextField("XXXX-XXXX", text: $codeField)
+                            TextField("XXXX-XXXX-XXXXX", text: $codeField)
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(.body, design: .monospaced))
                                 .autocorrectionDisabled()
@@ -77,7 +77,7 @@ struct SetupView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .disabled(codeField.count < 9 || ipField.isEmpty)
+                    .disabled(codeField.replacingOccurrences(of: "-", with: "").count < 13 || ipField.isEmpty)
                     .keyboardShortcut(.return, modifiers: [])
                 }
                 .padding(40)
@@ -101,17 +101,16 @@ struct SetupView: View {
         vm.connect(code: codeField, windowsIP: ipField)
     }
 
-    // Auto-insert dash after 4 chars, cap at 9 (XXXX-XXXX).
+    // Auto-insert dashes into 4-4-5 groups, cap at 13 chars (XXXX-XXXX-XXXXX).
     private func formatCode(_ raw: String) -> String {
         let stripped = raw.replacingOccurrences(of: "-", with: "")
                           .uppercased()
                           .filter { "23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains($0) }
-        let capped = String(stripped.prefix(8))
-        if capped.count > 4 {
-            let a = String(capped.prefix(4))
-            let b = String(capped.dropFirst(4))
-            return "\(a)-\(b)"
-        }
-        return capped
+        let capped = Array(stripped.prefix(13))
+        var groups: [String] = []
+        groups.append(String(capped.prefix(4)))
+        if capped.count > 4 { groups.append(String(capped[4..<min(8, capped.count)])) }
+        if capped.count > 8 { groups.append(String(capped[8..<capped.count])) }
+        return groups.joined(separator: "-")
     }
 }

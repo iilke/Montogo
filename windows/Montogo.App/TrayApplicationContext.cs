@@ -27,8 +27,6 @@ internal sealed class TrayApplicationContext : ApplicationContext
     // corrupted the stream, so it was removed. Softer than 15-18 Mbps but stable.
     private const int HardwareFps     = 60;
     private const int HardwareBitrate = 11_000_000;
-    private const int SoftwareFps     = 30;
-    private const int SoftwareBitrate =  5_000_000;
 
     private readonly NotifyIcon       _trayIcon;
     private readonly CancellationTokenSource _cts = new();
@@ -57,6 +55,27 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private Channel<(EncodedFrame Frame, uint FrameId)>? _sendChannel;
     private Task?        _sendTask;
     private Task?        _keyframeTask;   // forces a periodic IDR so P-frame error can't accumulate
+    private Task?        _livenessTask;   // stops the stream if the Mac stops sending valid feedback
+    private CancellationTokenSource? _sessionCts;   // per-session; cancelled on teardown so a re-handshake can restart cleanly
+    private readonly object _pipelineLock = new();  // serializes StartPipeline/TearDownPipeline across the handshake loop, watchdog, and reset
+
+    // Liveness: Windows keeps streaming only while it receives authenticated feedback from the
+    // paired Mac. Without this, a spoofed handshake (source IP forged to a victim on the LAN)
+    // could aim a continuous 60 fps stream at that victim — a reflection/amplification vector —
+    // and a force-quit Mac would leave Windows streaming into the void. If no valid feedback
+    // arrives for this long, the pipeline is torn down and Windows waits for a fresh handshake.
+    private const int LivenessTimeoutSeconds = 5;
+    // While the session is receiving authenticated feedback this recently, the real Mac is
+    // present, so incoming handshakes can only be replays — ignore them rather than tear the
+    // live session down (anti-replay). A genuine reconnect arrives after feedback goes stale.
+    private const int HandshakeReplayGraceSeconds = 3;
+    private DateTime _sessionStart = DateTime.MinValue;      // watchdog grace; set at StartPipeline
+    private DateTime _lastValidFeedback = DateTime.MinValue; // set ONLY on real feedback (not at start)
+
+    // Feedback authentication (v8): a per-session HMAC key derived from the ECDH shared secret,
+    // plus the highest counter seen — so feedback can't be forged or replayed by a LAN sniffer.
+    private byte[] _feedbackKey = Array.Empty<byte>();
+    private uint   _lastFeedbackCounter;
 
     // Adaptive bitrate — AIMD congestion control driven by the Mac's loss feedback AND the
     // local send-queue depth (see OnSendQueueDepth). The Mac's feedback is loss-based, but
@@ -132,13 +151,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 return;
             }
 
-            // Probe for GPU encoder before entering the handshake loop so we can
-            // advertise the correct fps in the HandshakeResponse.
-            bool hardware   = H264Encoder.IsHardwareEncoderAvailable();
-            int  targetFps  = hardware ? HardwareFps     : SoftwareFps;
-            int  targetBits = hardware ? HardwareBitrate : SoftwareBitrate;
+            // HEVC requires a hardware encoder; fail fast with a clear message rather than
+            // letting the Mac connect and then hit the encoder's NotSupportedException.
+            if (!H264Encoder.IsHardwareEncoderAvailable())
+            {
+                UpdateStatus("No hardware HEVC encoder found — Montogo needs an NVENC / Quick Sync / AMF GPU.");
+                return;
+            }
 
-            await HandshakeLoopAsync(display, targetFps, targetBits, ct);
+            await HandshakeLoopAsync(display, HardwareFps, HardwareBitrate, ct);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -186,53 +207,51 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
                 if (!IsHandshakeRequest(result.Buffer)) continue;
 
-                var req = MemoryMarshal.Read<HandshakeRequestPacket>(result.Buffer);
+                // Anti-replay: while the real Mac is actively confirming this session with
+                // authenticated feedback, a new handshake can only be a replay (a genuine
+                // reconnect arrives after feedback stops). Ignore it so a replayed handshake
+                // can't tear down and disrupt the live stream. Feedback is unforgeable (v8),
+                // so "healthy" reliably means the real Mac is here.
+                if (_capture is not null && _lastValidFeedback != DateTime.MinValue
+                    && (DateTime.UtcNow - _lastValidFeedback).TotalSeconds < HandshakeReplayGraceSeconds)
+                    continue;
 
-                // Reject requests whose token does not match: unknown device.
-                // Validating before the pipeline-running check keeps the DoS
-                // protection (unauthenticated floods never touch the pipeline)
-                // while allowing a relaunched Mac to reconnect below.
-                if (!_security.ValidateToken(req.ClientId, req.Token))
+                // Authenticate the request and run the ephemeral ECDH (in a sync helper — an
+                // async method can't hold Span locals). Verifies HMAC(authKey, request) — which
+                // proves the Mac knows the code and binds its ephemeral key — before any pipeline
+                // work, so an unauthenticated flood never touches the encoder.
+                if (!TryAuthenticateHandshake(result.Buffer, out Guid clientId, out byte[] winPub,
+                                              out AesGcm? sessionCipher, out byte[] feedbackKey, out byte[] macPubKey))
                 {
                     RecordRejectedAttempt(result.RemoteEndPoint.Address);
-                    // Surface the rejection locally (not to the network) so a wrong
-                    // connection code is visible instead of a silent "stuck connecting".
-                    // Only while not yet streaming, so it can't disturb a live session.
+                    // Surface the rejection locally (not to the network) so a wrong code is
+                    // visible instead of a silent "stuck connecting".
                     if (_capture is null)
                         UpdateStatus($"Wrong code from {result.RemoteEndPoint.Address} — Mac must enter {_security.ConnectionCode}");
                     continue;
                 }
 
-                if (_capture is not null)
-                {
-                    // Authenticated re-handshake: the Mac app was relaunched (new
-                    // ClientId) or lost the connection. Re-target the running
-                    // pipeline and resend the response with the existing nonce
-                    // prefix — no pipeline restart. Force a keyframe so the new
-                    // session can start decoding immediately (the GOP is long).
-                    _encoder!.RequestKeyFrame();
-                    _sender!.SetTarget(new IPEndPoint(result.RemoteEndPoint.Address, ProtocolConstants.VideoPort));
-                    await SendHandshakeResponseAsync(
-                        _listener, result.RemoteEndPoint, display, req.ClientId,
-                        targetFps, _sender.NoncePrefix, ct);
-                    UpdateStatus($"Connected – {result.RemoteEndPoint.Address} " +
-                        $"({(_encoder!.IsHardwareAccelerated ? "HW" : "SW")} {targetFps} fps, re-handshake)");
-                    continue;
-                }
+                // A handshake always establishes a fresh session key, so tear down any running
+                // pipeline (e.g. a relaunched or reconnecting Mac) and start clean on the new key.
+                if (_capture is not null) TearDownPipeline();
 
-                // Create sender now so its nonce prefix is known before the response goes out.
-                // The Mac must receive the prefix before any encrypted chunks arrive.
-                // Pass the listener so video is sent from the same source port (47921).
-                // This lets the Mac's stateful firewall treat video as a reply to the
-                // outbound handshake rather than unsolicited inbound traffic.
-                _sender = new UdpSender(_security.Cipher, sendSocket: _listener);
+                // This session's feedback authentication key + counter (reset per session).
+                _feedbackKey = feedbackKey;
+                _lastFeedbackCounter = 0;
+
+                // Create the sender now so its nonce prefix is known before the response goes
+                // out (the Mac needs it before any encrypted chunk). Reuse the listener socket
+                // so video shares source port 47921 (the Mac's firewall sees it as a reply).
+                _sender = new UdpSender(sessionCipher!, sendSocket: _listener);
                 _sender.SetTarget(new IPEndPoint(result.RemoteEndPoint.Address, ProtocolConstants.VideoPort));
 
                 await SendHandshakeResponseAsync(
-                    _listener, result.RemoteEndPoint, display, req.ClientId,
-                    targetFps, _sender.NoncePrefix, ct);
+                    _listener, result.RemoteEndPoint, display, clientId,
+                    targetFps, _sender.NoncePrefix, winPub, macPubKey, ct);
 
                 StartPipeline(display, targetFps, targetBitrate);
+                UpdateStatus($"Connected – {result.RemoteEndPoint.Address} " +
+                    $"({(_encoder!.IsHardwareAccelerated ? "HW" : "SW")} {targetFps} fps)");
             }
         }
         catch (OperationCanceledException) { }
@@ -242,9 +261,33 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    // Verifies a handshake request's HMAC and runs the ephemeral ECDH, returning the session
+    // cipher. Synchronous so it can use Span locals (an async method cannot). Returns false on
+    // a bad auth tag (wrong code) or a malformed peer key.
+    private bool TryAuthenticateHandshake(byte[] buffer, out Guid clientId, out byte[] winPub,
+                                          out AesGcm? sessionCipher, out byte[] feedbackKey, out byte[] macPubKey)
+    {
+        clientId = default;
+        winPub = Array.Empty<byte>();
+        sessionCipher = null;
+        feedbackKey = Array.Empty<byte>();
+        macPubKey = Array.Empty<byte>();
+
+        ReadOnlySpan<byte> buf = buffer.AsSpan();
+        ReadOnlySpan<byte> tag = buf.Slice(HandshakeLayout.ReqAuthTag, HandshakeLayout.AuthTagLen);
+        if (!_security.VerifyAuthTag(buf[..HandshakeLayout.ReqSigned], tag)) return false;
+
+        clientId = new Guid(buf.Slice(HandshakeLayout.ReqClientId, 16));
+        macPubKey = buf.Slice(HandshakeLayout.ReqPubKey, HandshakeLayout.PubKeyLen).ToArray();
+
+        // The ephemeral private key lives only for this call and is discarded (forward secrecy).
+        using var ecdh = SecurityContext.CreateEphemeral(out winPub);
+        return _security.DeriveSession(ecdh, macPubKey, out sessionCipher, out feedbackKey);
+    }
+
     private static bool IsHandshakeRequest(byte[] buf)
     {
-        if (buf.Length < Unsafe.SizeOf<HandshakeRequestPacket>()) return false;
+        if (buf.Length < HandshakeLayout.ReqSize) return false;
         if (BinaryPrimitives.ReadUInt16LittleEndian(buf) != ProtocolConstants.Magic) return false;
         if (buf[2] != ProtocolConstants.CurrentVersion) return false;
         return buf[3] == (byte)PacketType.HandshakeRequest;
@@ -252,7 +295,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private static bool IsFeedback(byte[] buf)
     {
-        if (buf.Length < Unsafe.SizeOf<FeedbackPacket>()) return false;
+        if (buf.Length < FeedbackLayout.Size) return false;
         if (BinaryPrimitives.ReadUInt16LittleEndian(buf) != ProtocolConstants.Magic) return false;
         if (buf[2] != ProtocolConstants.CurrentVersion) return false;
         return buf[3] == (byte)PacketType.Feedback;
@@ -263,19 +306,31 @@ internal sealed class TrayApplicationContext : ApplicationContext
     // link that can't hold a fixed rate — the encoder is told to send only what fits.
     private void HandleFeedback(byte[] buf, IPEndPoint source)
     {
-        if (_encoder is null || _sender?.Target is null || _adaptiveMax <= 0) return;
+        if (_encoder is null || _sender?.Target is null || _adaptiveMax <= 0 || _feedbackKey.Length == 0) return;
 
-        var fb = MemoryMarshal.Read<FeedbackPacket>(buf);
-        if (!_security.ValidateToken(fb.ClientId, fb.Token)) return;      // only the paired Mac may steer
+        // Authenticate with the per-session feedback key (unforgeable) + reject replays via the
+        // monotonic counter. The source-IP check stays as cheap defense-in-depth.
+        ReadOnlySpan<byte> fb = buf.AsSpan();
+        if (!SecurityContext.VerifyFeedbackTag(_feedbackKey,
+                fb[..FeedbackLayout.Signed], fb.Slice(FeedbackLayout.AuthTag, 32))) return;
         if (!source.Address.Equals(_sender.Target.Address)) return;
 
+        uint counter = BinaryPrimitives.ReadUInt32LittleEndian(fb.Slice(FeedbackLayout.Counter, 4));
+        if (counter <= _lastFeedbackCounter) return;   // stale or replayed
+        _lastFeedbackCounter = counter;
+
+        // Authenticated feedback from the paired Mac = proof the stream is reaching a real
+        // client. The liveness watchdog uses this to stop a stream nobody is consuming.
+        _lastValidFeedback = DateTime.UtcNow;
+
+        byte flags = fb[FeedbackLayout.Flags];
         // The Mac sets this when it sees a frameId gap (a lost/dropped frame broke the
         // P-frame reference chain). Sending an IDR now re-syncs it in ~1 RTT instead of
         // leaving it frozen until the next periodic keyframe (up to a second).
-        if ((fb.Flags & FeedbackFlags.RequestKeyframe) != 0)
+        if ((flags & FeedbackFlags.RequestKeyframe) != 0)
             _encoder.RequestKeyFrame();
 
-        double loss = fb.LossPermille / 1000.0;
+        double loss = BinaryPrimitives.ReadUInt16LittleEndian(fb.Slice(FeedbackLayout.LossPermille, 2)) / 1000.0;
 
         // Adaptive FEC: raise redundancy as loss climbs (responds every feedback, cheap).
         // More parity costs bandwidth, but the bitrate back-off below frees room for it.
@@ -356,25 +411,33 @@ internal sealed class TrayApplicationContext : ApplicationContext
         UpdateStatus($"Adapting: send queue {depth} → {next / 1_000_000.0:F1} Mbps (cap {_softCeiling / 1_000_000.0:F1})");
     }
 
-    private static async Task SendHandshakeResponseAsync(
+    // Builds the v9 handshake response: display params + Windows's ephemeral public key + the
+    // GCM nonce prefix, authenticated by a trailing HMAC(authKey, response-bytes ‖ macPubKey).
+    // Binding the request's macPubKey into the tag MACs the full exchange transcript (both
+    // ephemeral keys), so the response can't be lifted onto a different request.
+    private async Task SendHandshakeResponseAsync(
         UdpClient listener, IPEndPoint macEndpoint,
-        DisplayInfo display, Guid clientId, int targetFps, ulong noncePrefix, CancellationToken ct)
+        DisplayInfo display, Guid clientId, int targetFps, ulong noncePrefix, byte[] winPub, byte[] macPub, CancellationToken ct)
     {
-        var resp = new HandshakeResponsePacket
-        {
-            Magic             = ProtocolConstants.Magic,
-            Version           = ProtocolConstants.CurrentVersion,
-            PacketType        = (byte)PacketType.HandshakeResponse,
-            NegotiatedVersion = ProtocolConstants.CurrentVersion,
-            DisplayWidth      = (ushort)display.Width,
-            DisplayHeight     = (ushort)display.Height,
-            TargetFps         = (byte)targetFps,
-            ClientId          = clientId,
-            NoncePrefix       = noncePrefix,
-        };
+        byte[] buf = new byte[HandshakeLayout.RespSize];
+        BinaryPrimitives.WriteUInt16LittleEndian(buf, ProtocolConstants.Magic);
+        buf[2] = ProtocolConstants.CurrentVersion;
+        buf[3] = (byte)PacketType.HandshakeResponse;
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(HandshakeLayout.RespWidth),  (ushort)display.Width);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(HandshakeLayout.RespHeight), (ushort)display.Height);
+        buf[HandshakeLayout.RespFps]      = (byte)targetFps;
+        buf[HandshakeLayout.RespReserved] = 0;
+        clientId.ToByteArray().CopyTo(buf.AsSpan(HandshakeLayout.RespClientId, 16));
+        winPub.CopyTo(buf.AsSpan(HandshakeLayout.RespPubKey, HandshakeLayout.PubKeyLen));
+        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(HandshakeLayout.RespNoncePrefix), noncePrefix);
 
-        byte[] buf = new byte[Unsafe.SizeOf<HandshakeResponsePacket>()];
-        MemoryMarshal.Write(buf, in resp);
+        // HMAC input = the signed response bytes followed by the request's macPubKey.
+        byte[] mac = new byte[HandshakeLayout.RespSigned + HandshakeLayout.PubKeyLen];
+        buf.AsSpan(0, HandshakeLayout.RespSigned).CopyTo(mac);
+        macPub.CopyTo(mac.AsSpan(HandshakeLayout.RespSigned));
+        byte[] tag = _security.ComputeAuthTag(mac);
+        tag.CopyTo(buf.AsSpan(HandshakeLayout.RespAuthTag, HandshakeLayout.AuthTagLen));
+
         await listener.SendAsync(buf, macEndpoint, ct);
     }
 
@@ -382,8 +445,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void StartPipeline(DisplayInfo display, int targetFps, int targetBitrate)
     {
+        // Per-session cancellation so a re-handshake (which re-keys) can stop this session's
+        // background tasks and start a fresh one, without tearing down the whole app.
+        _sessionCts = new CancellationTokenSource();
+
         // _sender was created in HandshakeLoopAsync before the response was sent so that
-        // its NoncePrefix could be included in HandshakeResponsePacket.
+        // its NoncePrefix could be included in the handshake response.
         _encoder = new H264Encoder(
             new EncoderOptions(display.Width, display.Height, targetFps, targetBitrate));
 
@@ -446,14 +513,48 @@ internal sealed class TrayApplicationContext : ApplicationContext
         // on this config (IDR=0 per window), so P-frame prediction/quantization error had
         // nothing to reset it and accumulated over time. A once-a-second forced keyframe
         // bounds that — the standard low-latency approach when there's no intra-refresh.
+        CancellationToken sessionToken = _sessionCts.Token;
         _keyframeTask = Task.Run(async () =>
         {
             try
             {
-                while (!_cts.IsCancellationRequested)
+                while (!sessionToken.IsCancellationRequested)
                 {
-                    await Task.Delay(1000, _cts.Token);
+                    await Task.Delay(1000, sessionToken);
                     _encoder?.RequestKeyFrame();
+                }
+            }
+            catch (OperationCanceledException) { }
+        });
+
+        // Liveness + nonce-wrap watchdog. Stops the pipeline if (a) the paired Mac stops
+        // sending authenticated feedback (a departed/force-quit Mac, or a spoofed handshake that
+        // redirected the stream to a victim who can't produce valid feedback), or (b) the GCM
+        // sequence counter is about to wrap (reusing a nonce would break GCM). Either way the
+        // Mac's own watchdog then re-handshakes and a fresh session/key/nonce-prefix takes over.
+        _sessionStart = DateTime.UtcNow;
+        _lastValidFeedback = DateTime.MinValue;   // only real feedback counts as "alive"/"healthy"
+        _livenessTask = Task.Run(async () =>
+        {
+            try
+            {
+                while (!sessionToken.IsCancellationRequested)
+                {
+                    await Task.Delay(1000, sessionToken);
+                    // Alive = fed by real feedback, or still within the start grace window.
+                    DateTime alive = _lastValidFeedback > _sessionStart ? _lastValidFeedback : _sessionStart;
+                    if ((DateTime.UtcNow - alive).TotalSeconds > LivenessTimeoutSeconds)
+                    {
+                        UpdateStatus("No response from Mac — stream stopped; waiting for reconnect…");
+                        TearDownPipeline();   // safe: guarded by _pipelineLock; does not join this task
+                        return;
+                    }
+                    if (_sender?.NonceSpaceNearlyExhausted == true)
+                    {
+                        UpdateStatus("Rekeying (nonce limit) — reconnecting…");
+                        TearDownPipeline();
+                        return;
+                    }
                 }
             }
             catch (OperationCanceledException) { }
@@ -511,6 +612,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         Task.Run(() =>
         {
             _cts.Cancel();
+            _sessionCts?.Cancel();                         // stops the keyframe task
             _capture?.Stop();                              // joins the capture thread
             _channel?.Writer.TryComplete();               // signals the pipeline task to finish
             _sendChannel?.Writer.TryComplete();           // signals the send loop to finish
@@ -560,11 +662,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
             != DialogResult.Yes) return;
 
         // New secret → DPAPI-encrypt + persist, then swap the live security context so
-        // the handshake loop immediately validates against the new code and any new
-        // pipeline uses the new cipher.
-        string newCode = SecurityContext.EncodeConnectionCode(RandomNumberGenerator.GetBytes(5));
+        // the handshake loop immediately authenticates against the new code and any new
+        // pipeline uses a fresh session key.
+        string newCode = SecurityContext.EncodeConnectionCode(RandomNumberGenerator.GetBytes(8));
         _settings.SetConnectionCode(newCode);
-        SecurityContext oldSecurity = _security;
         _security = new SecurityContext(newCode);
         _codeItem.Text = $"Code: {_security.ConnectionCode}";
         UpdateStatus(_boundIp is null
@@ -575,11 +676,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         // drain here would freeze the tray). Dropping the stream makes the Mac's
         // watchdog fire; its next handshake carries the old code and is rejected, so it
         // falls back to its setup screen and must re-enter the new code.
-        Task.Run(() =>
-        {
-            TearDownPipeline();
-            oldSecurity.Dispose();
-        });
+        Task.Run(TearDownPipeline);
     }
 
     /// <summary>Stops and clears the capture→encode→send pipeline without touching the
@@ -587,16 +684,34 @@ internal sealed class TrayApplicationContext : ApplicationContext
     /// authenticated handshake. Does not cancel <c>_cts</c>.</summary>
     private void TearDownPipeline()
     {
-        _capture?.Stop();                              // joins the capture thread
-        _channel?.Writer.TryComplete();               // ends the pipeline task's read loop
-        _pipelineTask?.Wait(TimeSpan.FromSeconds(2)); // let encode + send drain
-        _encoder?.Dispose();
-        _sender?.Dispose();                            // does not close _listener (not owned)
-        _capture      = null;
-        _encoder      = null;
-        _sender       = null;
-        _channel      = null;
-        _pipelineTask = null;
+        // Guarded + idempotent: the handshake loop (re-handshake), the liveness watchdog, and
+        // "Reset connection code" can all call this, possibly at once.
+        lock (_pipelineLock)
+        {
+            if (_sessionCts is null) return;           // already torn down
+            _sessionCts.Cancel();                      // stops the keyframe + liveness tasks
+            _capture?.Stop();                          // joins the capture thread
+            _channel?.Writer.TryComplete();            // ends the pipeline task's read loop
+            _sendChannel?.Writer.TryComplete();        // ends the send loop
+            _pipelineTask?.Wait(TimeSpan.FromSeconds(2)); // let encode drain
+            _sendTask?.Wait(TimeSpan.FromSeconds(2));     // let the send loop drain
+            _keyframeTask?.Wait(TimeSpan.FromSeconds(1));
+            // Do NOT Wait on _livenessTask — it may be the caller (the watchdog), which would
+            // self-deadlock; cancelling _sessionCts already stops its loop.
+            _encoder?.Dispose();
+            _sender?.Dispose();                        // disposes the session cipher; not the listener (not owned)
+            _sessionCts.Dispose();
+            _capture      = null;
+            _encoder      = null;
+            _sender       = null;
+            _channel      = null;
+            _sendChannel  = null;
+            _pipelineTask = null;
+            _sendTask     = null;
+            _keyframeTask = null;
+            _livenessTask = null;
+            _sessionCts   = null;
+        }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -627,7 +742,6 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (disposing)
         {
             _cts.Dispose();
-            _security.Dispose();
             _driver?.Dispose();
             _listener?.Dispose();
             _trayIcon.Dispose();

@@ -59,6 +59,12 @@ public sealed class UdpSender : IDisposable
 
     public void SetTarget(IPEndPoint endpoint) => _target = endpoint;
 
+    /// <summary>True once the per-chunk SequenceNum counter (the GCM nonce base) is close to
+    /// wrapping. A wrap would repeat a (key, nonce) pair, which is catastrophic for GCM, so the
+    /// caller tears the session down and re-handshakes for a fresh nonce prefix before then.
+    /// ~0.27 billion packets of margin remain at this point (hours, even at a high packet rate).</summary>
+    public bool NonceSpaceNearlyExhausted => _sequenceNum > 0xF000_0000u;
+
     // --- Forward error correction (Reed–Solomon over GF(256)) ------------------
     // Every frame ships with m parity packets so the Mac can rebuild chunks the Wi-Fi
     // drops, with no retransmission round-trip. The code is systematic: data chunks go out
@@ -222,11 +228,15 @@ public sealed class UdpSender : IDisposable
         MemoryMarshal.Write(buf, in header);
 
         ReadOnlySpan<byte> plaintext = frame.Span.Slice(offset, chunkLen);
+        // Authenticate the plaintext header (frameId, chunk indices, flags, lengths) as GCM
+        // associated data so an on-path attacker can't tamper with routing/reassembly fields
+        // without failing the tag. The header bytes are already serialized into buf[0..Header).
         _cipher.Encrypt(
             nonce,
             plaintext,
             buf.AsSpan(HeaderSize, chunkLen),
-            buf.AsSpan(HeaderSize + chunkLen, ProtocolConstants.GcmTagSize));
+            buf.AsSpan(HeaderSize + chunkLen, ProtocolConstants.GcmTagSize),
+            buf.AsSpan(0, HeaderSize));
 
         if (parity is not null)
         {
@@ -257,14 +267,20 @@ public sealed class UdpSender : IDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(nonce.AsSpan(8), header.SequenceNum);
         MemoryMarshal.Write(buf, in header);
 
+        // Header authenticated as GCM associated data — see BuildDataChunk.
         _cipher.Encrypt(
             nonce,
             parity.AsSpan(stripeOffset, FecUnitSize),
             buf.AsSpan(HeaderSize, FecUnitSize),
-            buf.AsSpan(HeaderSize + FecUnitSize, ProtocolConstants.GcmTagSize));
+            buf.AsSpan(HeaderSize + FecUnitSize, ProtocolConstants.GcmTagSize),
+            buf.AsSpan(0, HeaderSize));
 
         return HeaderSize + FecUnitSize + ProtocolConstants.GcmTagSize;
     }
 
-    public void Dispose() { if (_ownsClient) _client.Dispose(); }
+    public void Dispose()
+    {
+        if (_ownsClient) _client.Dispose();
+        _cipher.Dispose();   // per-session AES-GCM key from the ECDH handshake
+    }
 }

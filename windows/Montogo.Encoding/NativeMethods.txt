@@ -51,9 +51,7 @@ MF_MT_DEFAULT_STRIDE
 
 // MF format GUIDs
 MFMediaType_Video
-MFVideoFormat_H264
 MFVideoFormat_HEVC
-MFVideoFormat_NV12
 
 // MF sample attribute GUIDs
 MFSampleExtension_CleanPoint

@@ -18,10 +18,22 @@ packages/
 .DS_Store
 Thumbs.db
 
-# Mac app (future)
+# Mac app
 mac/.build/
-mac/*.xcodeproj/xcuserdata/
-mac/*.xcworkspace/xcuserdata/
+# Xcode per-user state (paths, UI/scheme state) — anywhere in the tree, not just top level
+**/xcuserdata/
+*.xcuserstate
+mac/**/DerivedData/
+
+# Runtime/diagnostic logs
+*.log
+
+# Claude Code — personal, per-machine settings (shared .claude/settings.json is fine to commit)
+.claude/settings.local.json
+
+# Internal deep-reference docs (kept local; the public docs are README.md + PROTOCOL.md)
+/ARCHITECTURE.md
+/DECISIONS.md
 
 # Third-party virtual-display-rs CLI (provided per-machine, not committed)
 windows/Montogo.App/driver/
