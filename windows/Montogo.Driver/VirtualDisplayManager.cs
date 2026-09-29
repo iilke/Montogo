@@ -1,73 +1,61 @@
+using System.ComponentModel;
 using System.Diagnostics;
 
 namespace Montogo.Driver;
 
 /// <summary>
-/// Manages virtual monitors by shelling out to virtual-display-driver-cli.exe.
-/// The VddUserSession service must already be running — this class only controls monitors, not the service.
+/// Sets up the virtual monitor through an <b>elevated helper process</b>
+/// (<c>Montogo.DriverHelper.exe</c>) so the main app can stay non-elevated.
+///
+/// The virtual-display-rs v0.3.1 driver's control pipe is admin-only, so a normal-user
+/// process cannot add a monitor. Rather than run the whole (network-facing) app as
+/// administrator, we launch a tiny helper elevated once: it adds the monitor on start and
+/// removes it when this process exits.
 /// </summary>
 public sealed class VirtualDisplayManager : IDisposable
 {
-    private readonly string _cliPath;
+    public const string HelperExeName = "Montogo.DriverHelper.exe";
 
-    public VirtualDisplayManager(string cliPath)
+    /// <summary>
+    /// Launches the elevated helper (one UAC prompt) to add a <paramref name="width"/>×
+    /// <paramref name="height"/>@<paramref name="refreshRate"/> virtual monitor. The helper
+    /// removes it again when this process exits. Does not wait for the monitor to appear —
+    /// the caller polls the OS for that.
+    /// </summary>
+    public Task StartAsync(int width, int height, int refreshRate, CancellationToken ct = default)
     {
-        if (!File.Exists(cliPath))
-            throw new FileNotFoundException($"{DriverLocator.CliName} not found at the given path.", cliPath);
-        _cliPath = cliPath;
-    }
+        ct.ThrowIfCancellationRequested();
 
-    public Task AddMonitorAsync(int width, int height, int refreshRate, CancellationToken ct = default)
-        => RunAsync($"add {width}x{height}@{refreshRate}", ct);
+        string exe = Path.Combine(AppContext.BaseDirectory, HelperExeName);
+        if (!File.Exists(exe))
+            throw new FileNotFoundException(
+                $"{HelperExeName} was not found next to the app; it sets up the virtual display with elevated rights.",
+                exe);
 
-    // monitorId comes from ListMonitorsAsync → MonitorInfo.Id
-    public Task RemoveMonitorAsync(string monitorId, CancellationToken ct = default)
-        => RunAsync($"remove {monitorId}", ct);
-
-    public Task RemoveAllAsync(CancellationToken ct = default)
-        => RunAsync("remove-all", ct);
-
-    public Task PersistAsync(CancellationToken ct = default)
-        => RunAsync("persist", ct);
-
-    public async Task<IReadOnlyList<MonitorInfo>> ListMonitorsAsync(CancellationToken ct = default)
-    {
-        var output = await RunAsync("list", ct);
-        return MonitorInfo.ParseCliOutput(output);
-    }
-
-    private async Task<string> RunAsync(string arguments, CancellationToken ct)
-    {
-        using var process = new Process
+        var psi = new ProcessStartInfo
         {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = _cliPath,
-                Arguments = arguments,
-                RedirectStandardOutput = true,
-                RedirectStandardError  = true,
-                UseShellExecute  = false,
-                CreateNoWindow   = true,
-            }
+            FileName        = exe,
+            Arguments       = $"{width} {height} {refreshRate} {Environment.ProcessId}",
+            UseShellExecute = true,                       // required for elevation
+            Verb            = "runas",                    // prompt for elevation (UAC)
+            WindowStyle     = ProcessWindowStyle.Hidden,
         };
 
-        process.Start();
-
-        // Read both streams concurrently before waiting to avoid deadlock if
-        // either buffer fills up while the process is blocked writing the other.
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = process.StandardError.ReadToEndAsync(ct);
-        await process.WaitForExitAsync(ct);
-
-        var stdout = await stdoutTask;
-        var stderr = await stderrTask;
-
-        if (process.ExitCode != 0)
+        try
+        {
+            Process.Start(psi);
+        }
+        catch (Win32Exception ex) when (ex.NativeErrorCode == 1223) // ERROR_CANCELLED
+        {
             throw new InvalidOperationException(
-                $"virtual-display-driver-cli exited {process.ExitCode}: {stderr.Trim()}");
+                "Montogo needs a one-time administrator approval to set up the virtual display, " +
+                "but the elevation prompt was declined.");
+        }
 
-        return stdout;
+        return Task.CompletedTask;
     }
 
+    // Nothing to release here: the elevated helper watches this process and removes the
+    // virtual monitor when we exit.
     public void Dispose() { }
 }

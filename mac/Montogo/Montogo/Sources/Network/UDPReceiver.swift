@@ -257,16 +257,20 @@ actor UDPReceiver {
         // sender authenticated, so a tampered routing/reassembly field fails the tag.
         let aad = Data(data[0..<VideoChunkHeader.size])
         let plaintext = decryptor.decrypt(payload: payload, sequenceNum: header.sequenceNum, aad: aad)
-        // Count every arriving chunk by its continuous SequenceNum so gaps = packet loss.
+        // Diagnostics only (local, never sent): record every arriving chunk and whether it
+        // decrypted, so decrypt failures are visible in the timing log.
         FrameTimingLog.shared.recordChunk(seq: header.sequenceNum, decrypted: plaintext != nil)
-        // Same accounting over the shorter feedback window that drives adaptive bitrate.
+        guard let plaintext else { return }
+        // Loss accounting for the feedback report (which drives Windows's adaptive bitrate) must
+        // count ONLY authenticated chunks. Doing it before the GCM check would let an
+        // unauthenticated LAN attacker inject packets with a bogus SequenceNum to inflate the
+        // reported loss and force the encoder bitrate to the floor.
         if fbSeqMin == nil { fbSeqMin = header.sequenceNum; fbSeqMax = header.sequenceNum }
         else {
             if header.sequenceNum < fbSeqMin! { fbSeqMin = header.sequenceNum }
             if header.sequenceNum > fbSeqMax { fbSeqMax = header.sequenceNum }
         }
         fbCount += 1
-        guard let plaintext else { return }
         if let (frameId, nalData, isIDR, trace) = assembler.add(header: header, plaintext: plaintext,
                                                                 recvTime: recvTime) {
             gateAndDeliver(frameId, nalData, isIDR, trace)

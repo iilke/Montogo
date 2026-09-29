@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 580" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <defs>
+    <linearGradient id="flow" gradientUnits="userSpaceOnUse" x1="360" y1="188" x2="736" y2="188">
+      <stop offset="0" stop-color="#a855f7"/><stop offset="0.5" stop-color="#3b82f6"/><stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+    <marker id="grn" markerWidth="11" markerHeight="11" refX="7" refY="5.5" orient="auto"><path d="M0,0 L9,5.5 L0,11 Z" fill="#22c55e"/></marker>
+    <marker id="gry" markerWidth="10" markerHeight="10" refX="7" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 Z" fill="#64748b"/></marker>
+    <marker id="amb" markerWidth="10" markerHeight="10" refX="7" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 Z" fill="#f59e0b"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1100" height="580" rx="18" fill="#0b0e14"/>
+
+  <text x="60" y="50" fill="#e7ecf3" font-size="26" font-weight="700">Montogo — Adaptive Bitrate Loop</text>
+  <text x="60" y="76" fill="#8b96a8" font-size="14">A feedback loop keeps the bitrate riding just under the Wi-Fi's real capacity.</text>
+
+  <!-- loop nodes -->
+  <rect x="110" y="145" width="250" height="86" rx="14" fill="#141925" stroke="#262d3d"/>
+  <text x="235" y="180" fill="#e7ecf3" font-size="15" font-weight="600" text-anchor="middle">Windows encoder</text>
+  <text x="235" y="204" fill="#8b96a8" font-size="12" text-anchor="middle">HEVC @ bitrate B  +  FEC</text>
+
+  <rect x="740" y="145" width="250" height="86" rx="14" fill="#141925" stroke="#262d3d"/>
+  <text x="865" y="180" fill="#e7ecf3" font-size="15" font-weight="600" text-anchor="middle">Mac — measures loss</text>
+  <text x="865" y="204" fill="#8b96a8" font-size="12" text-anchor="middle">over a 400 ms window (seq gaps)</text>
+
+  <rect x="740" y="405" width="250" height="86" rx="14" fill="#141925" stroke="#262d3d"/>
+  <text x="865" y="440" fill="#e7ecf3" font-size="15" font-weight="600" text-anchor="middle">Authenticated feedback</text>
+  <text x="865" y="464" fill="#8b96a8" font-size="12" text-anchor="middle">loss ‰ + keyframe request</text>
+
+  <rect x="110" y="405" width="250" height="86" rx="14" fill="#141925" stroke="#262d3d"/>
+  <text x="235" y="440" fill="#e7ecf3" font-size="15" font-weight="600" text-anchor="middle">Adaptive controller</text>
+  <text x="235" y="464" fill="#8b96a8" font-size="12" text-anchor="middle">next bitrate + FEC %</text>
+
+  <!-- loop arrows -->
+  <text x="550" y="176" fill="#c9d3e0" font-size="12" font-weight="600" text-anchor="middle">encrypted HEVC · at the current bitrate</text>
+  <line x1="360" y1="188" x2="736" y2="188" stroke="url(#flow)" stroke-width="5" marker-end="url(#grn)"/>
+  <line x1="865" y1="231" x2="865" y2="401" stroke="#64748b" stroke-width="2" marker-end="url(#gry)"/>
+  <text x="550" y="472" fill="#8b96a8" font-size="11.5" text-anchor="middle">loss report + keyframe request (authenticated)</text>
+  <line x1="740" y1="448" x2="364" y2="448" stroke="#64748b" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#gry)"/>
+  <line x1="235" y1="405" x2="235" y2="235" stroke="#22c55e" stroke-width="2.5" marker-end="url(#grn)"/>
+  <text x="250" y="322" fill="#22c55e" font-size="10.5">sets bitrate + FEC</text>
+
+  <!-- send-queue signal into the controller -->
+  <line x1="235" y1="548" x2="235" y2="495" stroke="#f59e0b" stroke-width="2.5" marker-end="url(#amb)"/>
+  <text x="235" y="566" fill="#f59e0b" font-size="11" text-anchor="middle">send-queue depth — congestion the Mac reports as 0% loss</text>
+
+  <!-- control logic -->
+  <rect x="405" y="210" width="290" height="216" rx="16" fill="#12161f" stroke="#2a3550"/>
+  <text x="550" y="238" fill="#c9d3e0" font-size="13" font-weight="700" text-anchor="middle">Control logic (AIMD)</text>
+  <g font-size="12" fill="#e7ecf3">
+    <text x="426" y="268">▸  loss ↑  →  back off fast</text>
+    <text x="426" y="294">▸  clean &amp; quiet  →  probe up gently</text>
+    <text x="426" y="320">▸  send-queue full  →  cut + keyframe</text>
+    <text x="426" y="346">▸  converge on a learned soft ceiling</text>
+    <text x="426" y="372">▸  FEC 20% → 70% as loss rises</text>
+  </g>
+</svg>

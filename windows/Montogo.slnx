@@ -2,6 +2,7 @@
   <Project Path="Montogo.App/Montogo.App.csproj" />
   <Project Path="Montogo.Capture/Montogo.Capture.csproj" />
   <Project Path="Montogo.Driver/Montogo.Driver.csproj" />
+  <Project Path="Montogo.DriverHelper/Montogo.DriverHelper.csproj" />
   <Project Path="Montogo.Encoding/Montogo.Encoding.csproj" />
   <Project Path="Montogo.Protocol/Montogo.Protocol.csproj" />
   <Project Path="Montogo.Tests/Montogo.Tests.csproj" />

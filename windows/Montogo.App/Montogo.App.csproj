@@ -6,7 +6,22 @@
     <ProjectReference Include="..\Montogo.Encoding\Montogo.Encoding.csproj" />
     <ProjectReference Include="..\Montogo.Transport\Montogo.Transport.csproj" />
     <ProjectReference Include="..\Montogo.Protocol\Montogo.Protocol.csproj" />
+    <!-- Elevated helper: built before the app, but not referenced as code — the app only
+         launches its exe at runtime (to control the admin-only driver pipe). -->
+    <ProjectReference Include="..\Montogo.DriverHelper\Montogo.DriverHelper.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <!-- Ship the helper's exe (+ its runtimeconfig/deps/dlls) next to Montogo.App.exe so the
+       app can find and launch it. -->
+  <Target Name="CopyDriverHelper" AfterTargets="Build">
+    <ItemGroup>
+      <_DriverHelperFiles Include="$(MSBuildProjectDirectory)\..\Montogo.DriverHelper\bin\$(Configuration)\$(TargetFramework)\**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_DriverHelperFiles)"
+          DestinationFolder="$(OutDir)%(RecursiveDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 
   <!-- DPAPI (ProtectedData) is not in the shared framework on .NET 8; it ships as
        a NuGet package even for Windows-targeted apps. Used to encrypt the connection
@@ -21,14 +36,14 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>montogo.ico</ApplicationIcon>
   </PropertyGroup>
 
-  <!-- Copy the virtual-display-rs CLI into driver\ next to the built exe for every
-       build config, so CliPathResolver finds it in Debug and Release alike.
-       The binary is provided per-machine (see driver\ in the source tree) and is
-       git-ignored, matching the "user installs the driver separately" design. -->
+  <!-- Ship the multi-resolution app icon next to the exe so the tray can load its
+       16/32 px frame at the right DPI (the embedded ApplicationIcon covers the
+       exe/taskbar; NotifyIcon needs a small-size frame explicitly). -->
   <ItemGroup>
-    <None Include="driver\**" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="montogo.ico" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

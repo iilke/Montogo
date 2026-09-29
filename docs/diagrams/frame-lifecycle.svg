@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 540" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <defs>
+    <linearGradient id="flow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#a855f7"/>
+      <stop offset="0.5" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+    <marker id="grey" markerWidth="9" markerHeight="9" refX="6" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 Z" fill="#64748b"/></marker>
+    <marker id="grn" markerWidth="11" markerHeight="11" refX="7" refY="5.5" orient="auto"><path d="M0,0 L9,5.5 L0,11 Z" fill="#22c55e"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="540" rx="18" fill="#0b0e14"/>
+
+  <text x="60" y="50" fill="#e7ecf3" font-size="26" font-weight="700">Montogo — Frame Lifecycle</text>
+  <text x="60" y="76" fill="#8b96a8" font-size="14">One frame's journey: desktop pixels → HEVC → encrypted chunks → the wire → back to pixels.</text>
+
+  <!-- ===== WINDOWS ROW ===== -->
+  <text x="44" y="120" fill="#8b96a8" font-size="13" font-weight="700" letter-spacing="1">WINDOWS PC</text>
+  <rect x="30" y="126" width="1140" height="120" rx="16" fill="#141925" stroke="#262d3d"/>
+  <g>
+    <rect x="44"  y="138" width="196" height="96" rx="12" fill="#1b2231" stroke="#2f384b"/>
+    <text x="60" y="168" fill="#e7ecf3" font-size="15" font-weight="600">① Capture</text>
+    <text x="60" y="190" fill="#8b96a8" font-size="12">DXGI Desktop Duplication</text>
+    <text x="60" y="212" fill="#5b6473" font-size="11">1920×1080 BGRA + cursor</text>
+
+    <rect x="273" y="138" width="196" height="96" rx="12" fill="#1b2231" stroke="#2f384b"/>
+    <text x="289" y="168" fill="#e7ecf3" font-size="15" font-weight="600">② Encode</text>
+    <text x="289" y="190" fill="#8b96a8" font-size="12">HEVC · hardware MFT</text>
+    <text x="289" y="212" fill="#5b6473" font-size="11">→ compressed bitstream</text>
+
+    <rect x="502" y="138" width="196" height="96" rx="12" fill="#1b2231" stroke="#2f384b"/>
+    <text x="518" y="168" fill="#e7ecf3" font-size="15" font-weight="600">③ Chunk + FEC</text>
+    <text x="518" y="190" fill="#8b96a8" font-size="12">split ≤1400 B</text>
+    <text x="518" y="212" fill="#5b6473" font-size="11">+ Reed–Solomon parity</text>
+
+    <rect x="731" y="138" width="196" height="96" rx="12" fill="#1b2231" stroke="#2f384b"/>
+    <text x="747" y="168" fill="#e7ecf3" font-size="15" font-weight="600">④ Encrypt</text>
+    <text x="747" y="190" fill="#8b96a8" font-size="12">AES-256-GCM per chunk</text>
+    <text x="747" y="212" fill="#5b6473" font-size="11">28 B header (AAD) + 16 B tag</text>
+
+    <rect x="960" y="138" width="196" height="96" rx="12" fill="#1b2231" stroke="#2f384b"/>
+    <text x="976" y="168" fill="#e7ecf3" font-size="15" font-weight="600">⑤ Send</text>
+    <text x="976" y="190" fill="#8b96a8" font-size="12">UDP datagrams</text>
+    <text x="976" y="212" fill="#5b6473" font-size="11">single socket</text>
+  </g>
+  <line x1="244" y1="186" x2="269" y2="186" stroke="#64748b" stroke-width="2" marker-end="url(#grey)"/>
+  <line x1="473" y1="186" x2="498" y2="186" stroke="#64748b" stroke-width="2" marker-end="url(#grey)"/>
+  <line x1="702" y1="186" x2="727" y2="186" stroke="#64748b" stroke-width="2" marker-end="url(#grey)"/>
+  <line x1="931" y1="186" x2="956" y2="186" stroke="#64748b" stroke-width="2" marker-end="url(#grey)"/>
+
+  <!-- ===== NETWORK HOP (gradient, serpentine) ===== -->
+  <path d="M1058,234 V292 H142 V360" fill="none" stroke="url(#flow)" stroke-width="6" stroke-linejoin="round" marker-end="url(#grn)"/>
+  <text x="600" y="284" fill="#c9d3e0" font-size="12.5" font-weight="600" text-anchor="middle">the wire — encrypted HEVC · AES-256-GCM · UDP over Wi-Fi / LAN</text>
+
+  <!-- ===== MAC ROW ===== -->
+  <text x="44" y="346" fill="#8b96a8" font-size="13" font-weight="700" letter-spacing="1">MACBOOK</text>
+  <rect x="30" y="352" width="1140" height="120" rx="16" fill="#141925" stroke="#262d3d"/>
+  <g>
+    <rect x="44"  y="364" width="196" height="96" rx="12" fill="#1b2231" stroke="#2f384b"/>
+    <text x="60" y="394" fill="#e7ecf3" font-size="15" font-weight="600">⑥ Receive</text>
+    <text x="60" y="416" fill="#8b96a8" font-size="12">UDP datagrams</text>
+    <text x="60" y="438" fill="#5b6473" font-size="11">into a reassembly buffer</text>
+
+    <rect x="273" y="364" width="196" height="96" rx="12" fill="#1b2231" stroke="#2f384b"/>
+    <text x="289" y="394" fill="#e7ecf3" font-size="15" font-weight="600">⑦ Decrypt</text>
+    <text x="289" y="416" fill="#8b96a8" font-size="12">AES-256-GCM open</text>
+    <text x="289" y="438" fill="#5b6473" font-size="11">verify header (AAD)</text>
+
+    <rect x="502" y="364" width="196" height="96" rx="12" fill="#1b2231" stroke="#2f384b"/>
+    <text x="518" y="394" fill="#e7ecf3" font-size="15" font-weight="600">⑧ Recover</text>
+    <text x="518" y="416" fill="#8b96a8" font-size="12">reassemble + FEC rebuild</text>
+    <text x="518" y="438" fill="#5b6473" font-size="11">→ HEVC bitstream</text>
+
+    <rect x="731" y="364" width="196" height="96" rx="12" fill="#1b2231" stroke="#2f384b"/>
+    <text x="747" y="394" fill="#e7ecf3" font-size="15" font-weight="600">⑨ Decode</text>
+    <text x="747" y="416" fill="#8b96a8" font-size="12">VideoToolbox (hardware)</text>
+    <text x="747" y="438" fill="#5b6473" font-size="11">→ YCbCr 4:2:0 buffer</text>
+
+    <rect x="960" y="364" width="196" height="96" rx="12" fill="url(#flow)" stroke="#2f384b"/>
+    <text x="976" y="394" fill="#0b0e14" font-size="15" font-weight="700">⑩ Render</text>
+    <text x="976" y="416" fill="#0b0e14" font-size="12" opacity="0.85">Metal · YCbCr→RGB</text>
+    <text x="976" y="438" fill="#0b0e14" font-size="11" opacity="0.8">→ your second screen</text>
+  </g>
+  <line x1="244" y1="412" x2="269" y2="412" stroke="#64748b" stroke-width="2" marker-end="url(#grey)"/>
+  <line x1="473" y1="412" x2="498" y2="412" stroke="#64748b" stroke-width="2" marker-end="url(#grey)"/>
+  <line x1="702" y1="412" x2="727" y2="412" stroke="#64748b" stroke-width="2" marker-end="url(#grey)"/>
+  <line x1="931" y1="412" x2="956" y2="412" stroke="#64748b" stroke-width="2" marker-end="url(#grey)"/>
+
+  <text x="600" y="512" fill="#7c8496" font-size="12" text-anchor="middle">Any chunk the Wi-Fi drops is rebuilt from Reed–Solomon parity — no retransmission, no round-trip.</text>
+</svg>

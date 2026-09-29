@@ -104,13 +104,31 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
         _trayIcon = new NotifyIcon
         {
-            Icon             = SystemIcons.Application,
+            Icon             = LoadTrayIcon(),
             Text             = "Montogo – Starting…",
             Visible          = true,
             ContextMenuStrip = BuildMenu(),
         };
 
         _ = Task.Run(() => InitAsync(_cts.Token));
+    }
+
+    // Load the app icon's small (tray-sized) frame from montogo.ico shipped next to
+    // the exe, so the tray shows the Montogo logo at the current DPI. Falls back to
+    // the generic application icon if the file is missing or unreadable.
+    private static Icon LoadTrayIcon()
+    {
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "montogo.ico");
+            if (File.Exists(path))
+                return new Icon(path, SystemInformation.SmallIconSize);
+        }
+        catch
+        {
+            // fall through to the system default
+        }
+        return SystemIcons.Application;
     }
 
     private ContextMenuStrip BuildMenu()
@@ -136,18 +154,17 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         try
         {
-            // Set up virtual display
-            string cliPath = CliPathResolver.Resolve(_settings);
-            _driver = new VirtualDisplayManager(cliPath);
-
-            await _driver.RemoveAllAsync(ct);
-            await _driver.AddMonitorAsync(VirtualWidth, VirtualHeight, HardwareFps, ct);
+            // Set up the virtual display via the elevated helper (one UAC prompt); the app
+            // itself stays non-elevated. The helper adds the monitor now and removes it when
+            // this process exits.
+            _driver = new VirtualDisplayManager();
+            await _driver.StartAsync(VirtualWidth, VirtualHeight, HardwareFps, ct);
 
             // DXGI may take up to ~3 s to expose the new output
             DisplayInfo? display = await WaitForVirtualDisplayAsync(ct);
             if (display is null)
             {
-                UpdateStatus("Error: virtual display did not appear — is the driver service running?");
+                UpdateStatus("Error: virtual display did not appear — is the virtual-display-rs driver installed?");
                 return;
             }
 
@@ -601,14 +618,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         _trayIcon.Visible = false;
 
-        // Tear down on a thread-pool thread, NOT here on the WinForms UI thread.
-        // RemoveAllAsync ultimately awaits the driver CLI's Process I/O; blocking on it
-        // with GetResult() while on the UI thread deadlocks — those awaited continuations
-        // try to resume on this thread's captured SynchronizationContext, but the thread
-        // is blocked in GetResult(). That deadlock is what left the process hung
-        // (Application.Exit was never reached) and the virtual display un-removed.
-        // Off the UI thread there is no captured context, so the awaits resume on the
-        // pool and RemoveAllAsync runs to completion before we exit.
+        // Tear down on a thread-pool thread, NOT the WinForms UI thread, so the bounded
+        // .Wait()s below can't deadlock against task continuations captured on the UI
+        // context. The virtual display itself is removed by the elevated helper when this
+        // process exits, so there's nothing driver-related to do here.
         Task.Run(() =>
         {
             _cts.Cancel();
@@ -622,8 +635,6 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _encoder?.Dispose();                          // NOTIFY_END_STREAMING + MFShutdown
             _sender?.Dispose();                           // does NOT close _listener (not owned)
             _listener?.Dispose();                         // close after the sender is done
-            try { _driver?.RemoveAllAsync().GetAwaiter().GetResult(); } // remove the virtual display
-            catch { }
         }).Wait(TimeSpan.FromSeconds(5));                 // bounded so a stuck teardown can't hang exit
 
         Application.Exit();

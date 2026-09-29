@@ -37,3 +37,17 @@ mac/**/DerivedData/
 
 # Third-party virtual-display-rs CLI (provided per-machine, not committed)
 windows/Montogo.App/driver/
+
+# Windows installer build artifacts (fetched/produced by installer/windows/build.ps1).
+# The pinned driver is documented in installer/windows/driver-pin.md and fetched by hash.
+/installer/windows/driver/
+/installer/windows/build/
+/installer/windows/dist/
+
+# Mac installer build artifacts (produced by installer/mac/build-dmg.sh)
+/installer/mac/build/
+/installer/mac/dist/
+
+# Logo source masters — kept local only; the built app icons are committed in each
+# project (windows/Montogo.App/montogo.ico, mac Assets.xcassets/AppIcon).
+/branding/

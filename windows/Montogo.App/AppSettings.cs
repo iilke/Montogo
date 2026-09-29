@@ -18,12 +18,6 @@ internal sealed class AppSettings
     private static readonly byte[] DpapiEntropy = "montogo-shared-secret-v1"u8.ToArray();
 
     /// <summary>
-    /// Absolute path to virtual-display-driver-cli.exe.
-    /// Leave null to use the default driver\ folder next to the exe.
-    /// </summary>
-    public string? DriverCliPath { get; set; }
-
-    /// <summary>
     /// On-disk form of the connection code: DPAPI-encrypted
     /// (DataProtectionScope.CurrentUser) and base64-encoded. Legacy installs may
     /// hold the plaintext code here — it is migrated to the encrypted form on first

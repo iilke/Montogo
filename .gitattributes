@@ -1,0 +1,6 @@
+# Shell scripts must stay LF so they run on macOS/Linux even when committed from Windows.
+*.sh text eol=lf
+
+# Keep other cross-platform text files normalized to LF.
+*.iss text eol=lf
+*.ps1 text eol=crlf
