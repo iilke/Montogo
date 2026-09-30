@@ -4,7 +4,7 @@
 
 ![Montogo in action — a MacBook (left) showing a Windows PC's screen as a wireless second monitor over Wi-Fi.](docs/setup.jpg)
 
-Windows creates a virtual 1080p60 display, captures it, hardware-encodes it as **HEVC (H.265)**, encrypts every packet, and streams it over UDP to the Mac, which decrypts, hardware-decodes, and renders it full-screen with Metal. The link is one-directional — Windows sends pixels, the Mac is a passive screen. Keyboard, mouse, and **audio stay on Windows**: only video is streamed.
+Windows creates a virtual 1080p60 display, captures it, hardware-encodes it as **HEVC (H.265)**, encrypts every video packet, and streams it over UDP to the Mac, which decrypts, hardware-decodes, and renders it full-screen with Metal. The link is one-directional — Windows sends pixels, the Mac is a passive screen. Keyboard, mouse, and **audio stay on Windows**: only video is streamed.
 
 ![Montogo system architecture — the Windows capture/encode/encrypt pipeline streaming encrypted HEVC over UDP to the Mac's receive/decrypt/decode/render pipeline, with authenticated link-quality feedback flowing back.](docs/diagrams/system-architecture.svg)
 
@@ -16,7 +16,7 @@ Windows creates a virtual 1080p60 display, captures it, hardware-encodes it as *
 
 - **HEVC (H.265), hardware end-to-end** — NVENC/Quick Sync/AMF encode on Windows, VideoToolbox decode on the Mac. ~2× the efficiency of H.264, so more picture fits a Wi-Fi link.
 - **Low latency by design** — synchronous decode, vsync rendering, and adaptive pacing keep it responsive on a healthy Wi-Fi link.
-- **Encrypted & authenticated** — AES-256-GCM on every packet, an authenticated ephemeral-ECDH handshake, and **forward secrecy** (see [DESIGN.md](docs/DESIGN.md#security)).
+- **Encrypted & authenticated** — AES-256-GCM on every video packet, an authenticated ephemeral-ECDH handshake (with authenticated link feedback), and **forward secrecy** (see [DESIGN.md](docs/DESIGN.md#security)).
 - **Adapts to the link** — the bitrate learns your Wi-Fi's real capacity and rides it; a lost frame re-syncs in ~1 round-trip instead of freezing for a second.
 - **Zero cloud** — no server, no account, no pairing service. Two apps on one LAN and a short code you type once.
 
@@ -90,3 +90,13 @@ The Mac remembers the pairing (code in the Keychain, IP in preferences) and auto
 | Crypto | AES-256-GCM, HKDF, HMAC, P-256 ECDH | same (CryptoKit) |
 
 The two apps share **no code** — only the wire protocol in [`PROTOCOL.md`](windows/Montogo.Protocol/PROTOCOL.md), which each implements natively. Full architecture and internals: **[docs/DESIGN.md](docs/DESIGN.md)**.
+
+---
+
+## License
+
+Montogo is free software under the **GNU Affero General Public License v3.0** (AGPL-3.0) — see [LICENSE](LICENSE). Copyright © 2026 İlke.
+
+You're free to use, study, modify, and share it. Any distributed or network-deployed derivative must also be released under the AGPL, so Montogo can't be turned into a closed-source product.
+
+The Windows installer bundles the third-party [virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs) driver (v0.3.1, also AGPL-3.0), unmodified — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

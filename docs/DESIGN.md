@@ -10,7 +10,7 @@ steps, and [`PROTOCOL.md`](../windows/Montogo.Protocol/PROTOCOL.md) has the exac
 ## System architecture
 
 Windows creates a virtual 1080p60 display, captures it, hardware-encodes it as **HEVC
-(H.265)**, encrypts every packet, and streams it over UDP to the Mac, which decrypts,
+(H.265)**, encrypts every video packet, and streams it over UDP to the Mac, which decrypts,
 hardware-decodes, and renders it full-screen with Metal. The link is one-directional — Windows
 sends pixels, the Mac is a passive screen. Keyboard, mouse, and **audio stay on Windows**.
 
@@ -39,7 +39,8 @@ One frame's journey from the Windows desktop to the Mac screen:
 ## Security
 
 Montogo runs on your local network, and the link is hardened with modern cryptography — an
-authenticated ephemeral key exchange, forward secrecy, and AES-256-GCM on every packet.
+authenticated ephemeral key exchange, forward secrecy, and AES-256-GCM on every video
+packet (the handshake and link feedback are authenticated with HMAC, not encrypted).
 
 ![Montogo pairing & handshake sequence — both sides derive an HMAC auth key from the 13-char code, exchange HMAC-authenticated ephemeral P-256 public keys, and derive a fresh AES-256-GCM session key from the ECDH shared secret before any encrypted video flows.](diagrams/pairing-handshake.svg)
 

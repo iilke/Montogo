@@ -114,7 +114,7 @@ begin
       'Montogo installs a small open-source display driver',
       'To mirror a screen to your Mac, Montogo needs a virtual monitor. This installer will:'
         + #13#10#13#10
-        + '    -  install the open-source virtual-display-rs driver (v0.3.1, MIT-licensed), and'
+        + '    -  install the open-source virtual-display-rs driver (v0.3.1, AGPLv3-licensed), and'
         + #13#10
         + '    -  trust that driver''s certificate on this PC so Windows accepts the driver.'
         + #13#10#13#10

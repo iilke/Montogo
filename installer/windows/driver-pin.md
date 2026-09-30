@@ -1,8 +1,9 @@
 # Pinned dependency — virtual-display-rs driver
 
 Montogo bundles the third-party [virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs)
-driver (MIT-licensed) in its Windows installer. It is **pinned** to one reviewed release and
-verified by hash — we never fetch "latest".
+driver (**AGPL-3.0**-licensed) in its Windows installer. It is **pinned** to one reviewed release and
+verified by hash — we never fetch "latest". Its license and corresponding-source pointer are
+recorded in [`THIRD-PARTY-NOTICES.md`](../../THIRD-PARTY-NOTICES.md).
 
 | | |
 |---|---|
